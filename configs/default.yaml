@@ -1,0 +1,94 @@
+project:
+  name: large-medical-image-patch-classification
+  task: patch-classification
+  output_dir: outputs
+
+data:
+  raw_dir: G:\18disease_full
+  patch_dir: data/patches
+  metadata_dir: data/metadata
+  split_dir: data/splits
+  cache_dir: data/cache
+  patch_size: 512
+  num_classes: 18
+  image_extension: .png
+
+prepare_patches:
+  raw_dir: G:\18disease_full
+  output_dir: data/cache/patches
+  metadata_path: data/metadata/patch_metadata.csv
+  summary_path: data/metadata/patch_summary.json
+  patch_size: 512
+  stride: 256
+  edge_mode: drop
+  save_format:
+  pad_value: 0
+  patient_id_strategy: auto
+  enable_patch_filter: true
+  black_pixel_threshold: 5
+  max_black_ratio: 0.90
+  min_std: 8.0
+
+build_patch_splits:
+  metadata_path: data/metadata/patch_metadata.csv
+  output_dir: data/splits
+  all_patches_path: data/splits/all_patches.csv
+  label_mapping_path: data/splits/label_mapping.json
+  summary_path: data/splits/split_summary.json
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+  group_by: auto
+
+evaluation:
+  level: image
+  aggregation: mean_prob
+  report_patch_metrics: true
+  report_image_metrics: true
+
+train:
+  batch_size: 16
+  num_workers: 4
+  epochs: 10
+  device: cuda
+  mixed_precision: true
+  seed: 42
+
+dataloader:
+  pin_memory: true
+  drop_last: false
+
+augmentation:
+  resize_height: 544
+  resize_width: 544
+  crop_size: 512
+  horizontal_flip: 0.5
+  vertical_flip: 0.5
+  normalize: imagenet
+
+model:
+  name: resnet18
+  pretrained: true
+  dropout: 0.0
+
+loss:
+  name: focal
+  gamma: 2.0
+  alpha:
+  reduction: mean
+  use_alpha_from_class_counts: true
+  use_class_weights: false
+
+optimizer:
+  name: adam
+  lr: 0.0003
+  weight_decay: 0.0001
+
+scheduler:
+  name: steplr
+  step_size: 5
+  gamma: 0.1
+  eta_min: 0.0
+  factor: 0.1
+  patience: 2
