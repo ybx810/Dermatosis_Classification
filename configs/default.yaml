@@ -4,7 +4,7 @@ project:
   output_dir: outputs
 
 data:
-  raw_dir: G:\18disease_full
+  raw_dir: E:\skin-image-classification\data\raw\18disease_full
   patch_dir: data/patches
   metadata_dir: data/metadata
   split_dir: data/splits
@@ -14,7 +14,7 @@ data:
   image_extension: .png
 
 prepare_patches:
-  raw_dir: G:\18disease_full
+  raw_dir: E:\skin-image-classification\data\raw\18disease_full
   output_dir: data/cache/patches
   metadata_path: data/metadata/patch_metadata.csv
   summary_path: data/metadata/patch_summary.json
@@ -70,7 +70,7 @@ augmentation:
 model:
   name: resnet18
   pretrained: true
-  dropout: 0.0
+  dropout: 0.3
 
 loss:
   name: focal
@@ -86,7 +86,7 @@ optimizer:
   weight_decay: 0.0001
 
 scheduler:
-  name: steplr
+  name: plateau
   step_size: 5
   gamma: 0.1
   eta_min: 0.0
