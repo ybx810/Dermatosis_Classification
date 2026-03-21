@@ -6,9 +6,10 @@ import logging
 import math
 import random
 import sys
-from collections import Counter
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -21,6 +22,9 @@ from src.utils.io import load_yaml
 REQUIRED_COLUMNS = ["patch_path", "label", "source_image"]
 SPLIT_EXPORT_COLUMNS = ["patch_path", "label", "label_idx", "source_image", "patient_id", "patch_row", "patch_col", "split"]
 SPLIT_NAMES = ("train", "val", "test")
+COVERAGE_SPLITS = ("train", "val", "test")
+LIMITED_GROUP_PRIORITY = ("train", "test", "val")
+EXTRA_GROUP_PRIORITY = ("test", "train", "val")
 
 
 @dataclass
@@ -41,17 +45,8 @@ class SplitBuildConfig:
 class GroupRecord:
     group_id: str
     row_indices: list[int]
-    label_counts: Counter
+    label: str
     patch_count: int
-
-
-@dataclass
-class SplitState:
-    name: str
-    target_ratio: float
-    patch_count: int = 0
-    group_ids: list[str] = field(default_factory=list)
-    label_counts: Counter = field(default_factory=Counter)
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-ratio", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--group-by", choices=["auto", "patient_id", "source_image"], default=None)
+    parser.add_argument("--run-self-check", action="store_true", help="Run internal allocation checks and exit.")
     return parser.parse_args()
 
 
@@ -206,158 +202,181 @@ def assign_group_keys(dataframe: pd.DataFrame, group_by: str) -> tuple[pd.DataFr
 def build_group_records(dataframe: pd.DataFrame) -> list[GroupRecord]:
     group_records: list[GroupRecord] = []
     for group_id, group_df in dataframe.groupby("group_id", sort=True):
+        labels = sorted(group_df["label"].astype(str).unique().tolist())
+        if len(labels) != 1:
+            raise ValueError(
+                "Each group must contain exactly one class label for explicit per-class allocation. "
+                f"group_id={group_id!r}, labels={labels}. "
+                "If group_by=patient_id causes multi-class groups, please split patients differently or use source_image grouping."
+            )
+
         group_records.append(
             GroupRecord(
                 group_id=group_id,
                 row_indices=group_df.index.to_list(),
-                label_counts=Counter(group_df["label"].tolist()),
+                label=labels[0],
                 patch_count=len(group_df),
             )
         )
     return group_records
 
 
-def active_splits(config: SplitBuildConfig) -> list[SplitState]:
+def build_split_ratios(config: SplitBuildConfig) -> dict[str, float]:
     ratios = {
-        "train": config.train_ratio,
-        "val": config.val_ratio,
-        "test": config.test_ratio,
+        "train": float(config.train_ratio),
+        "val": float(config.val_ratio),
+        "test": float(config.test_ratio),
     }
-    ratio_sum = sum(ratios.values())
-    return [
-        SplitState(name=name, target_ratio=ratio / ratio_sum)
-        for name, ratio in ratios.items()
-        if ratio > 0
-    ]
+    total = sum(ratios.values())
+    if total <= 0:
+        raise ValueError("Split ratio sum must be positive.")
+    return {split_name: ratio / total for split_name, ratio in ratios.items()}
 
 
-def clone_split_states(states: dict[str, SplitState]) -> dict[str, SplitState]:
-    cloned: dict[str, SplitState] = {}
-    for name, state in states.items():
-        cloned[name] = SplitState(
-            name=state.name,
-            target_ratio=state.target_ratio,
-            patch_count=state.patch_count,
-            group_ids=state.group_ids.copy(),
-            label_counts=Counter(state.label_counts),
+def build_label_to_groups(group_records: list[GroupRecord]) -> dict[str, list[GroupRecord]]:
+    groups_by_label: dict[str, list[GroupRecord]] = defaultdict(list)
+    for group_record in group_records:
+        groups_by_label[group_record.label].append(group_record)
+    return {label: groups_by_label[label] for label in sorted(groups_by_label)}
+
+
+def allocate_remainder_by_priority(
+    counts: dict[str, int],
+    remainder: int,
+    priority: tuple[str, ...],
+) -> None:
+    if remainder <= 0:
+        return
+
+    priority_index = 0
+    while remainder > 0:
+        split_name = priority[priority_index % len(priority)]
+        counts[split_name] += 1
+        remainder -= 1
+        priority_index += 1
+
+
+def select_splits_for_limited_groups(num_groups: int, split_ratios: dict[str, float]) -> list[str]:
+    ordered_splits = sorted(
+        SPLIT_NAMES,
+        key=lambda split_name: (-split_ratios[split_name], LIMITED_GROUP_PRIORITY.index(split_name)),
+    )
+    return ordered_splits[:num_groups]
+
+
+def plan_class_group_allocation(
+    label: str,
+    num_groups: int,
+    split_ratios: dict[str, float],
+) -> dict[str, int]:
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive for label {label!r}, got: {num_groups}")
+
+    counts = {split_name: 0 for split_name in SPLIT_NAMES}
+
+    if num_groups == 1:
+        selected_split = select_splits_for_limited_groups(num_groups, split_ratios)[0]
+        counts[selected_split] = 1
+        logging.warning(
+            "Label '%s' has only 1 group. Cannot cover train/val/test simultaneously; assigning to %s only.",
+            label,
+            selected_split,
         )
-    return cloned
+        return counts
 
+    if num_groups == 2:
+        selected_splits = select_splits_for_limited_groups(num_groups, split_ratios)
+        for split_name in selected_splits:
+            counts[split_name] += 1
+        logging.warning(
+            "Label '%s' has only 2 groups. Cannot cover all three splits; assigning to %s.",
+            label,
+            selected_splits,
+        )
+        return counts
 
-def compute_assignment_score(
-    states: dict[str, SplitState],
-    label_totals: Counter,
-    total_patch_count: int,
-) -> float:
-    total_score = 0.0
-    for state in states.values():
-        target_size = state.target_ratio * total_patch_count
-        size_penalty = abs(state.patch_count - target_size) / max(1, total_patch_count)
-        overflow_penalty = max(0.0, state.patch_count - target_size) / max(1, total_patch_count)
-        empty_penalty = 0.25 if not state.group_ids else 0.0
+    for split_name in COVERAGE_SPLITS:
+        if split_ratios[split_name] <= 0:
+            logging.warning(
+                "Label '%s' has %s groups, so split coverage overrides the non-positive %s ratio.",
+                label,
+                num_groups,
+                split_name,
+            )
+        counts[split_name] = 1
 
-        label_penalty = 0.0
-        for label, total_for_label in label_totals.items():
-            target_label_count = state.target_ratio * total_for_label
-            label_penalty += abs(state.label_counts[label] - target_label_count) / max(1, total_for_label)
+    remaining_groups = num_groups - len(COVERAGE_SPLITS)
+    base_allocations = {
+        split_name: int(math.floor(remaining_groups * split_ratios[split_name]))
+        for split_name in SPLIT_NAMES
+    }
+    for split_name, value in base_allocations.items():
+        counts[split_name] += value
 
-        total_score += label_penalty + size_penalty + (2.0 * overflow_penalty) + empty_penalty
+    allocated_groups = len(COVERAGE_SPLITS) + sum(base_allocations.values())
+    remainder = num_groups - allocated_groups
+    allocate_remainder_by_priority(counts, remainder, EXTRA_GROUP_PRIORITY)
 
-    return total_score
-
-
-def choose_best_split(
-    group_record: GroupRecord,
-    states: dict[str, SplitState],
-    split_order: list[str],
-    label_totals: Counter,
-    total_patch_count: int,
-) -> str:
-    best_split = split_order[0]
-    best_score: tuple[float, str] | None = None
-
-    for split_name in split_order:
-        projected_states = clone_split_states(states)
-        projected_state = projected_states[split_name]
-        projected_state.group_ids.append(group_record.group_id)
-        projected_state.patch_count += group_record.patch_count
-        projected_state.label_counts.update(group_record.label_counts)
-
-        score = compute_assignment_score(projected_states, label_totals, total_patch_count)
-        score_tuple = (score, split_name)
-        if best_score is None or score_tuple < best_score:
-            best_score = score_tuple
-            best_split = split_name
-
-    return best_split
+    if sum(counts.values()) != num_groups:
+        raise RuntimeError(
+            f"Internal allocation error for label {label!r}: expected {num_groups} groups, got {counts}"
+        )
+    return counts
 
 
 def assign_groups_to_splits(
     group_records: list[GroupRecord],
     config: SplitBuildConfig,
-    label_totals: Counter,
-    total_patch_count: int,
-) -> dict[str, str]:
-    split_state_template = active_splits(config)
-    split_order = [state.name for state in split_state_template]
-    target_sorted_splits = [state.name for state in sorted(split_state_template, key=lambda item: (-item.target_ratio, item.name))]
+) -> tuple[dict[str, str], dict[str, dict[str, int]], dict[str, int]]:
+    split_ratios = build_split_ratios(config)
+    groups_by_label = build_label_to_groups(group_records)
+    rng = random.Random(config.seed)
 
-    trial_count = min(256, max(32, len(group_records) * 8))
-    best_group_to_split: dict[str, str] | None = None
-    best_score: float | None = None
+    group_to_split: dict[str, str] = {}
+    per_class_group_distribution: dict[str, dict[str, int]] = {}
+    per_class_group_counts: dict[str, int] = {}
 
-    for trial_index in range(trial_count):
-        trial_rng = random.Random(config.seed + trial_index)
-        shuffled_groups = group_records[:]
-        trial_rng.shuffle(shuffled_groups)
-        ordered_groups = sorted(
-            shuffled_groups,
-            key=lambda record: (
-                -max(record.label_counts.values()),
-                -record.patch_count,
-                record.group_id,
-            ),
+    for label in sorted(groups_by_label):
+        label_groups = list(groups_by_label[label])
+        rng.shuffle(label_groups)
+
+        per_class_group_counts[label] = len(label_groups)
+        split_counts = plan_class_group_allocation(
+            label=label,
+            num_groups=len(label_groups),
+            split_ratios=split_ratios,
         )
+        per_class_group_distribution[label] = dict(split_counts)
 
-        split_states = {
-            state.name: SplitState(name=state.name, target_ratio=state.target_ratio)
-            for state in split_state_template
-        }
-        group_to_split: dict[str, str] = {}
-        remaining_groups = ordered_groups[:]
+        start_index = 0
+        for split_name in SPLIT_NAMES:
+            count = split_counts[split_name]
+            selected_groups = label_groups[start_index : start_index + count]
+            for group_record in selected_groups:
+                if group_record.group_id in group_to_split:
+                    raise RuntimeError(f"Group {group_record.group_id!r} was assigned more than once.")
+                group_to_split[group_record.group_id] = split_name
+            start_index += count
 
-        for split_name in target_sorted_splits:
-            if not remaining_groups:
-                break
-            group_record = remaining_groups.pop(0)
-            state = split_states[split_name]
-            state.group_ids.append(group_record.group_id)
-            state.patch_count += group_record.patch_count
-            state.label_counts.update(group_record.label_counts)
-            group_to_split[group_record.group_id] = split_name
-
-        for group_record in remaining_groups:
-            split_name = choose_best_split(
-                group_record=group_record,
-                states=split_states,
-                split_order=split_order,
-                label_totals=label_totals,
-                total_patch_count=total_patch_count,
+        if start_index != len(label_groups):
+            raise RuntimeError(
+                f"Label '{label}' allocation did not consume all groups: consumed={start_index}, total={len(label_groups)}"
             )
-            state = split_states[split_name]
-            state.group_ids.append(group_record.group_id)
-            state.patch_count += group_record.patch_count
-            state.label_counts.update(group_record.label_counts)
-            group_to_split[group_record.group_id] = split_name
 
-        score = compute_assignment_score(split_states, label_totals, total_patch_count)
-        if best_score is None or score < best_score:
-            best_score = score
-            best_group_to_split = group_to_split
+    return group_to_split, per_class_group_distribution, per_class_group_counts
 
-    if best_group_to_split is None:
-        return {}
-    return best_group_to_split
+
+def validate_patch_split_consistency(dataframe: pd.DataFrame) -> None:
+    for group_column in ["group_id", "source_image"]:
+        if group_column not in dataframe.columns:
+            continue
+        split_counts = dataframe.groupby(group_column)["split"].nunique()
+        inconsistent = split_counts[split_counts > 1]
+        if not inconsistent.empty:
+            preview = inconsistent.index.tolist()[:5]
+            raise ValueError(
+                f"Found {len(inconsistent)} {group_column} entries assigned to multiple splits. Examples: {preview}"
+            )
 
 
 def save_dataframe(dataframe: pd.DataFrame, path: Path) -> None:
@@ -369,8 +388,19 @@ def format_distribution(counter: Counter) -> dict[str, int]:
     return {label: int(count) for label, count in sorted(counter.items())}
 
 
-def summarize_splits(dataframe: pd.DataFrame, grouping_strategy: str, seed: int) -> dict:
-    split_summaries: dict[str, dict] = {}
+def compute_per_class_group_distribution(dataframe: pd.DataFrame) -> dict[str, dict[str, int]]:
+    distribution: dict[str, dict[str, int]] = {}
+    for label in sorted(dataframe["label"].astype(str).unique().tolist()):
+        label_df = dataframe[dataframe["label"].astype(str) == label]
+        distribution[label] = {
+            split_name: int(label_df[label_df["split"] == split_name]["group_id"].nunique())
+            for split_name in SPLIT_NAMES
+        }
+    return distribution
+
+
+def summarize_splits(dataframe: pd.DataFrame, grouping_strategy: str, seed: int) -> dict[str, Any]:
+    split_summaries: dict[str, dict[str, Any]] = {}
     for split_name in SPLIT_NAMES:
         split_df = dataframe[dataframe["split"] == split_name]
         if split_df.empty:
@@ -393,6 +423,7 @@ def summarize_splits(dataframe: pd.DataFrame, grouping_strategy: str, seed: int)
         "total_patches": int(len(dataframe)),
         "total_groups": int(dataframe["group_id"].nunique()),
         "label_distribution": format_distribution(Counter(dataframe["label"].tolist())),
+        "per_class_group_distribution": compute_per_class_group_distribution(dataframe),
         "splits": split_summaries,
     }
 
@@ -406,7 +437,27 @@ def save_label_mapping(label_mapping: dict[str, int], path: Path) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def log_split_summary(summary: dict) -> None:
+def log_per_class_group_summary(
+    per_class_group_counts: dict[str, int],
+    per_class_group_distribution: dict[str, dict[str, int]],
+) -> None:
+    logging.info("Per-class group counts:")
+    for label in sorted(per_class_group_counts):
+        logging.info("  %s | groups=%s", label, per_class_group_counts[label])
+
+    logging.info("Per-class split allocation (group counts):")
+    for label in sorted(per_class_group_distribution):
+        distribution = per_class_group_distribution[label]
+        logging.info(
+            "  %s | train=%s val=%s test=%s",
+            label,
+            distribution.get("train", 0),
+            distribution.get("val", 0),
+            distribution.get("test", 0),
+        )
+
+
+def log_split_summary(summary: dict[str, Any]) -> None:
     logging.info("Grouping strategy: %s", summary["grouping_strategy"])
     logging.info("Total patches: %s", summary["total_patches"])
     logging.info("Total groups: %s", summary["total_groups"])
@@ -431,7 +482,7 @@ def export_split_files(dataframe: pd.DataFrame, output_dir: Path) -> None:
         save_dataframe(split_df[export_columns], output_dir / f"{split_name}.csv")
 
 
-def run_split_builder(config: SplitBuildConfig) -> dict:
+def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
     dataframe = load_patch_metadata(config.metadata_path)
     dataframe, grouping_strategy = assign_group_keys(dataframe, config.group_by)
 
@@ -439,14 +490,17 @@ def run_split_builder(config: SplitBuildConfig) -> dict:
     dataframe["label_idx"] = dataframe["label"].map(label_mapping)
 
     group_records = build_group_records(dataframe)
-    label_totals = Counter(dataframe["label"].tolist())
-    group_to_split = assign_groups_to_splits(
+    group_to_split, per_class_group_distribution, per_class_group_counts = assign_groups_to_splits(
         group_records=group_records,
         config=config,
-        label_totals=label_totals,
-        total_patch_count=len(dataframe),
     )
     dataframe["split"] = dataframe["group_id"].map(group_to_split)
+
+    if dataframe["split"].isna().any():
+        missing_groups = sorted(dataframe.loc[dataframe["split"].isna(), "group_id"].astype(str).unique().tolist())
+        raise RuntimeError(f"Some groups were not assigned to any split: {missing_groups[:10]}")
+
+    validate_patch_split_consistency(dataframe)
 
     ordered_columns = [
         column
@@ -467,20 +521,49 @@ def run_split_builder(config: SplitBuildConfig) -> dict:
         config.summary_path.parent.mkdir(parents=True, exist_ok=True)
         config.summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    log_per_class_group_summary(per_class_group_counts, per_class_group_distribution)
     log_split_summary(summary)
     logging.info("Saved all patches file to %s", config.all_patches_path)
     logging.info("Saved label mapping to %s", config.label_mapping_path)
     return summary
 
 
+def run_allocation_self_checks() -> None:
+    split_ratios = {"train": 0.7, "val": 0.15, "test": 0.15}
+
+    counts_three = plan_class_group_allocation("three_case", 3, split_ratios)
+    assert counts_three == {"train": 1, "val": 1, "test": 1}, counts_three
+
+    counts_four = plan_class_group_allocation("four_case", 4, split_ratios)
+    assert counts_four == {"train": 1, "val": 1, "test": 2}, counts_four
+
+    counts_two = plan_class_group_allocation("two_case", 2, split_ratios)
+    assert counts_two == {"train": 1, "val": 0, "test": 1}, counts_two
+
+    inheritance_df = pd.DataFrame(
+        [
+            {"patch_path": "a_patch_1.png", "label": "A", "source_image": "img_a", "group_id": "group_a", "split": "train"},
+            {"patch_path": "a_patch_2.png", "label": "A", "source_image": "img_a", "group_id": "group_a", "split": "train"},
+            {"patch_path": "b_patch_1.png", "label": "B", "source_image": "img_b", "group_id": "group_b", "split": "test"},
+            {"patch_path": "b_patch_2.png", "label": "B", "source_image": "img_b", "group_id": "group_b", "split": "test"},
+        ]
+    )
+    validate_patch_split_consistency(inheritance_df)
+
+    logging.info("All internal split-allocation self-checks passed.")
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
+
+    if args.run_self_check:
+        run_allocation_self_checks()
+        return
+
     config = build_config(args)
     run_split_builder(config)
 
 
 if __name__ == "__main__":
     main()
-
-
