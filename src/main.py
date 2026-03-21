@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import torch
 import yaml
 
@@ -16,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.datasets.skin_mil_dataset import build_mil_dataloader
 from src.datasets.skin_patch_dataset import build_dataloader
 from src.engine import train_one_epoch, validate
 from src.losses import build_loss
@@ -26,7 +28,7 @@ from src.utils.visualize import export_training_visualizations
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a patch classification baseline model.")
+    parser = argparse.ArgumentParser(description="Train a patch baseline or attention-based MIL model.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     return parser.parse_args()
 
@@ -52,6 +54,14 @@ def resolve_path(path_value: str | Path | None) -> Path | None:
     if path.is_absolute():
         return path
     return PROJECT_ROOT / path
+
+
+def get_task_mode(config: dict[str, Any]) -> str:
+    task_config = config.get("task", {})
+    mode = str(task_config.get("mode", "patch")).lower() if isinstance(task_config, dict) else "patch"
+    if mode not in {"patch", "mil"}:
+        raise ValueError(f"Unsupported task.mode: {mode}. Expected one of ['patch', 'mil']")
+    return mode
 
 
 def build_run_dir(config: dict[str, Any]) -> Path:
@@ -122,17 +132,74 @@ def build_scheduler(
     raise ValueError(f"Unsupported scheduler: {name}")
 
 
-def compute_class_counts(train_csv: Path) -> list[int]:
-    import pandas as pd
-
+def compute_class_counts(
+    train_csv: Path,
+    task_mode: str,
+    num_classes: int | None = None,
+    label_names: list[str] | None = None,
+) -> list[int]:
     dataframe = pd.read_csv(train_csv)
-    if "label_idx" in dataframe.columns:
-        label_counts = Counter(dataframe["label_idx"].tolist())
-        num_classes = max(label_counts.keys()) + 1 if label_counts else 0
-        return [int(label_counts.get(index, 0)) for index in range(num_classes)]
+    if task_mode == "mil":
+        if "source_image" not in dataframe.columns:
+            raise ValueError(f"MIL mode requires source_image in split CSV: {train_csv}")
 
-    labels = sorted(dataframe["label"].astype(str).unique().tolist())
-    counts = dataframe["label"].astype(str).value_counts().to_dict()
+        dataframe["source_image"] = dataframe["source_image"].fillna("").astype(str).str.strip()
+        if (dataframe["source_image"].str.len() == 0).any():
+            raise ValueError(f"MIL mode requires non-empty source_image values in {train_csv}")
+
+        if "label_idx" in dataframe.columns:
+            bag_label_indices: list[int] = []
+            for source_image, group_df in dataframe.groupby("source_image", sort=True):
+                label_values = sorted(group_df["label_idx"].astype(int).unique().tolist())
+                if len(label_values) != 1:
+                    raise ValueError(
+                        f"MIL class count computation requires one label_idx per source_image. "
+                        f"source_image={source_image!r}, label_idx={label_values}"
+                    )
+                bag_label_indices.append(int(label_values[0]))
+
+            counts = Counter(bag_label_indices)
+            total_classes = int(num_classes) if num_classes is not None else (max(counts.keys()) + 1 if counts else 0)
+            return [int(counts.get(index, 0)) for index in range(total_classes)]
+
+        dataframe["label"] = dataframe["label"].astype(str)
+        bag_labels: list[str] = []
+        for source_image, group_df in dataframe.groupby("source_image", sort=True):
+            labels = sorted(group_df["label"].unique().tolist())
+            if len(labels) != 1:
+                raise ValueError(
+                    f"MIL class count computation requires one label per source_image. "
+                    f"source_image={source_image!r}, labels={labels}"
+                )
+            bag_labels.append(labels[0])
+
+        if label_names is not None:
+            counts = Counter(bag_labels)
+            unknown_labels = sorted(set(counts).difference(label_names))
+            if unknown_labels:
+                raise ValueError(
+                    f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}"
+                )
+            return [int(counts.get(label_name, 0)) for label_name in label_names]
+
+        counts = Counter(bag_labels)
+        labels = sorted(counts)
+        return [int(counts.get(label, 0)) for label in labels]
+
+    if "label_idx" in dataframe.columns:
+        label_counts = Counter(dataframe["label_idx"].astype(int).tolist())
+        total_classes = int(num_classes) if num_classes is not None else (max(label_counts.keys()) + 1 if label_counts else 0)
+        return [int(label_counts.get(index, 0)) for index in range(total_classes)]
+
+    label_series = dataframe["label"].astype(str)
+    counts = Counter(label_series.tolist())
+    if label_names is not None:
+        unknown_labels = sorted(set(counts).difference(label_names))
+        if unknown_labels:
+            raise ValueError(f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}")
+        return [int(counts.get(label_name, 0)) for label_name in label_names]
+
+    labels = sorted(counts)
     return [int(counts.get(label, 0)) for label in labels]
 
 
@@ -193,24 +260,30 @@ def _append_validation_metrics(epoch_record: dict[str, Any], val_metrics: dict[s
         epoch_record["val_image_auc_ovr"] = val_metrics.get("image_auc_ovr")
 
 
-def run_training(config: dict[str, Any]) -> Path:
-    seed = int(config.get("train", {}).get("seed", 42))
-    seed_everything(seed)
-
-    run_dir = build_run_dir(config)
-    setup_logging(run_dir / "train.log")
-    save_config_snapshot(config, run_dir)
-
-    device = select_device(config)
-    use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
-    logging.info("Run directory: %s", run_dir)
-    logging.info("Device: %s", device)
-    logging.info("AMP enabled: %s", use_amp)
-
-    split_dir = resolve_path(config.get("build_patch_splits", {}).get("output_dir", "data/splits"))
-    label_mapping_path = resolve_path(config.get("build_patch_splits", {}).get("label_mapping_path", "data/splits/label_mapping.json"))
-    train_csv = split_dir / "train.csv"
-    val_csv = split_dir / "val.csv"
+def _build_train_and_val_loaders(
+    config: dict[str, Any],
+    task_mode: str,
+    train_csv: Path,
+    val_csv: Path,
+    label_mapping_path: Path | None,
+) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    if task_mode == "mil":
+        train_loader = build_mil_dataloader(
+            csv_file=train_csv,
+            mode="train",
+            config=config,
+            label_mapping_path=label_mapping_path,
+            project_root=PROJECT_ROOT,
+        )
+        val_loader = build_mil_dataloader(
+            csv_file=val_csv,
+            mode="val",
+            config=config,
+            label_mapping_path=label_mapping_path,
+            project_root=PROJECT_ROOT,
+            shuffle=False,
+        )
+        return train_loader, val_loader
 
     train_loader = build_dataloader(
         csv_file=train_csv,
@@ -227,23 +300,66 @@ def run_training(config: dict[str, Any]) -> Path:
         project_root=PROJECT_ROOT,
         shuffle=False,
     )
+    return train_loader, val_loader
+
+
+def run_training(config: dict[str, Any]) -> Path:
+    seed = int(config.get("train", {}).get("seed", 42))
+    seed_everything(seed)
+
+    run_dir = build_run_dir(config)
+    setup_logging(run_dir / "train.log")
+    save_config_snapshot(config, run_dir)
+
+    task_mode = get_task_mode(config)
+    device = select_device(config)
+    use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
+    logging.info("Run directory: %s", run_dir)
+    logging.info("Task mode: %s", task_mode)
+    logging.info("Device: %s", device)
+    logging.info("AMP enabled: %s", use_amp)
+
+    split_dir = resolve_path(config.get("build_patch_splits", {}).get("output_dir", "data/splits"))
+    label_mapping_path = resolve_path(config.get("build_patch_splits", {}).get("label_mapping_path", "data/splits/label_mapping.json"))
+    train_csv = split_dir / "train.csv"
+    val_csv = split_dir / "val.csv"
+    label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
+    num_classes = len(label_names) if label_names is not None else config.get("data", {}).get("num_classes")
+
+    train_loader, val_loader = _build_train_and_val_loaders(
+        config=config,
+        task_mode=task_mode,
+        train_csv=train_csv,
+        val_csv=val_csv,
+        label_mapping_path=label_mapping_path,
+    )
 
     model = build_model(config).to(device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
-    class_counts = compute_class_counts(train_csv)
+    class_counts = compute_class_counts(train_csv, task_mode=task_mode, num_classes=num_classes, label_names=label_names)
     criterion = build_loss(config, class_counts=class_counts, device=device)
-    label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
     logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
-    logging.info(
-        "Evaluation: level=%s aggregation=%s",
-        config.get("evaluation", {}).get("level", "both"),
-        config.get("evaluation", {}).get("aggregation", "mean_prob"),
-    )
+    if task_mode == "mil":
+        logging.info(
+            "MIL config: max_instances_per_bag=%s min_instances_per_bag=%s sample_strategy=%s embedding_dim=%s attention_hidden_dim=%s dropout=%s",
+            config.get("mil", {}).get("max_instances_per_bag"),
+            config.get("mil", {}).get("min_instances_per_bag", 1),
+            config.get("mil", {}).get("sample_strategy", "none"),
+            config.get("mil", {}).get("embedding_dim", 256),
+            config.get("mil", {}).get("attention_hidden_dim", 128),
+            config.get("mil", {}).get("dropout", config.get("model", {}).get("dropout", 0.0)),
+        )
+    else:
+        logging.info(
+            "Evaluation: level=%s aggregation=%s",
+            config.get("evaluation", {}).get("level", "both"),
+            config.get("evaluation", {}).get("aggregation", "mean_prob"),
+        )
 
     num_epochs = int(config.get("train", {}).get("epochs", 20))
     history: list[dict[str, float | int | str | None]] = []
@@ -259,6 +375,8 @@ def run_training(config: dict[str, Any]) -> Path:
             epoch=epoch,
             scaler=scaler,
             use_amp=use_amp,
+            task_mode=task_mode,
+            config=config,
         )
         val_metrics = validate(
             model=model,
@@ -352,3 +470,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

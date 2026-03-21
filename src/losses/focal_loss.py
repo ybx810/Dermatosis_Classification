@@ -12,7 +12,11 @@ def build_alpha_from_class_counts(
     class_counts: Sequence[int] | dict[Any, int],
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Build inverse-frequency class weights for Focal Loss alpha."""
+    """Build inverse-frequency class weights for Focal Loss alpha.
+
+    Zero-count classes are clamped to one sample so the returned tensor stays finite
+    even when a training split does not contain every class in the global label space.
+    """
 
     if isinstance(class_counts, dict):
         counts = [class_counts[key] for key in sorted(class_counts)]
@@ -21,11 +25,14 @@ def build_alpha_from_class_counts(
 
     if not counts:
         raise ValueError("class_counts must not be empty.")
-    if any(count <= 0 for count in counts):
-        raise ValueError("All class counts must be positive.")
+    if any(count < 0 for count in counts):
+        raise ValueError("All class counts must be non-negative.")
+    if all(count == 0 for count in counts):
+        raise ValueError("At least one class count must be positive.")
 
     counts_tensor = torch.tensor(counts, dtype=torch.float32)
-    alpha = counts_tensor.sum() / counts_tensor
+    effective_counts = torch.clamp(counts_tensor, min=1.0)
+    alpha = effective_counts.sum() / effective_counts
 
     if normalize:
         alpha = alpha / alpha.sum() * len(counts)

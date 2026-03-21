@@ -3,6 +3,9 @@ project:
   task: patch-classification
   output_dir: outputs
 
+task:
+  mode: mil
+
 data:
   raw_dir: E:\skin-image-classification\data\raw\18disease_full
   patch_dir: data/patches
@@ -46,6 +49,16 @@ evaluation:
   aggregation: mean_prob
   report_patch_metrics: true
   report_image_metrics: true
+
+mil:
+  enabled: true
+  max_instances_per_bag: 64
+  min_instances_per_bag: 1
+  sample_strategy: random
+  embedding_dim: 256
+  attention_hidden_dim: 128
+  dropout: 0.3
+  return_attention: true
 
 train:
   batch_size: 16

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -10,10 +10,13 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from src.datasets.skin_mil_dataset import build_mil_dataloader
 from src.datasets.skin_patch_dataset import build_dataloader
 from src.losses import build_loss
 from src.models import build_model
 from src.utils.metrics import (
+    build_single_level_evaluation_result,
+    compute_classification_metrics,
     compute_multilevel_classification_metrics,
     save_confusion_matrix_figure,
     save_metrics_json,
@@ -31,6 +34,15 @@ def _resolve_path(project_root: Path, path_value: str | Path | None) -> Path | N
 
 
 
+def _get_task_mode(config: dict[str, Any]) -> str:
+    task_config = config.get("task", {})
+    mode = str(task_config.get("mode", "patch")).lower() if isinstance(task_config, dict) else "patch"
+    if mode not in {"patch", "mil"}:
+        raise ValueError(f"Unsupported task mode: {mode}. Expected one of ['patch', 'mil']")
+    return mode
+
+
+
 def _select_device(config: dict[str, Any]) -> torch.device:
     requested = str(config.get("train", {}).get("device", "cuda")).lower()
     if requested == "cuda" and torch.cuda.is_available():
@@ -39,15 +51,73 @@ def _select_device(config: dict[str, Any]) -> torch.device:
 
 
 
-def _compute_class_counts(train_csv: Path) -> list[int]:
+def _compute_class_counts(
+    train_csv: Path,
+    task_mode: str,
+    num_classes: int | None = None,
+    label_names: list[str] | None = None,
+) -> list[int]:
     dataframe = pd.read_csv(train_csv)
-    if "label_idx" in dataframe.columns:
-        label_counts = Counter(dataframe["label_idx"].tolist())
-        num_classes = max(label_counts.keys()) + 1 if label_counts else 0
-        return [int(label_counts.get(index, 0)) for index in range(num_classes)]
+    if task_mode == "mil":
+        if "source_image" not in dataframe.columns:
+            raise ValueError(f"MIL mode requires source_image in split CSV: {train_csv}")
 
-    labels = sorted(dataframe["label"].astype(str).unique().tolist())
-    counts = dataframe["label"].astype(str).value_counts().to_dict()
+        dataframe["source_image"] = dataframe["source_image"].fillna("").astype(str).str.strip()
+        if (dataframe["source_image"].str.len() == 0).any():
+            raise ValueError(f"MIL mode requires non-empty source_image values in {train_csv}")
+
+        if "label_idx" in dataframe.columns:
+            bag_label_indices: list[int] = []
+            for source_image, group_df in dataframe.groupby("source_image", sort=True):
+                label_values = sorted(group_df["label_idx"].astype(int).unique().tolist())
+                if len(label_values) != 1:
+                    raise ValueError(
+                        f"MIL class count computation requires a single label_idx per source_image. "
+                        f"source_image={source_image!r}, label_idx={label_values}"
+                    )
+                bag_label_indices.append(int(label_values[0]))
+
+            counts = Counter(bag_label_indices)
+            total_classes = int(num_classes) if num_classes is not None else (max(counts.keys()) + 1 if counts else 0)
+            return [int(counts.get(index, 0)) for index in range(total_classes)]
+
+        dataframe["label"] = dataframe["label"].astype(str)
+        bag_labels: list[str] = []
+        for source_image, group_df in dataframe.groupby("source_image", sort=True):
+            labels = sorted(group_df["label"].unique().tolist())
+            if len(labels) != 1:
+                raise ValueError(
+                    f"MIL class count computation requires a single label per source_image. "
+                    f"source_image={source_image!r}, labels={labels}"
+                )
+            bag_labels.append(labels[0])
+
+        counts = Counter(bag_labels)
+        if label_names is not None:
+            unknown_labels = sorted(set(counts).difference(label_names))
+            if unknown_labels:
+                raise ValueError(
+                    f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}"
+                )
+            return [int(counts.get(label_name, 0)) for label_name in label_names]
+
+        labels = sorted(counts)
+        return [int(counts.get(label, 0)) for label in labels]
+
+    if "label_idx" in dataframe.columns:
+        label_counts = Counter(dataframe["label_idx"].astype(int).tolist())
+        total_classes = int(num_classes) if num_classes is not None else (max(label_counts.keys()) + 1 if label_counts else 0)
+        return [int(label_counts.get(index, 0)) for index in range(total_classes)]
+
+    label_series = dataframe["label"].astype(str)
+    counts = Counter(label_series.tolist())
+    if label_names is not None:
+        unknown_labels = sorted(set(counts).difference(label_names))
+        if unknown_labels:
+            raise ValueError(f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}")
+        return [int(counts.get(label_name, 0)) for label_name in label_names]
+
+    labels = sorted(counts)
     return [int(counts.get(label, 0)) for label in labels]
 
 
@@ -82,6 +152,11 @@ def _save_level_artifacts(metrics: dict[str, Any], output_dir: Path, prefix: str
     logging.info("Saved %s confusion matrix to %s", prefix, confusion_path)
 
 
+
+def _move_bag_batch_to_device(bag_batch: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
+    return [bag.to(device, non_blocking=True) for bag in bag_batch]
+
+
 @torch.no_grad()
 def test_model(
     model: torch.nn.Module,
@@ -96,6 +171,7 @@ def test_model(
     """Run evaluation on the test set and save metrics/artifacts."""
 
     model.eval()
+    task_mode = _get_task_mode(evaluation_config or {})
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,40 +184,66 @@ def test_model(
 
     progress = tqdm(dataloader, desc="Test", leave=False)
     for batch in progress:
-        images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
+        if task_mode == "mil":
+            bag_images = _move_bag_batch_to_device(batch["images"], device)
+            labels = batch["label"].to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(bag_images, return_attention=False)
+                loss = criterion(logits, labels)
+
+            batch_size = labels.size(0)
+        else:
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(images)
+                loss = criterion(logits, labels)
+
+            batch_size = images.size(0)
+            if "source_image" in batch:
+                source_images.extend([str(value) for value in batch["source_image"]])
+            if "patch_path" in batch:
+                patch_paths.extend([str(value) for value in batch["patch_path"]])
 
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(probs, dim=1)
 
-        batch_size = images.size(0)
         running_loss += float(loss.detach().item()) * batch_size
         predictions.extend(preds.cpu().tolist())
         targets.extend(labels.cpu().tolist())
         probabilities.extend(probs.cpu().tolist())
-
-        if "source_image" in batch:
-            source_images.extend([str(value) for value in batch["source_image"]])
-        if "patch_path" in batch:
-            patch_paths.extend([str(value) for value in batch["patch_path"]])
-
         progress.set_postfix(loss=f"{loss.detach().item():.4f}")
 
     test_loss = running_loss / max(1, len(dataloader.dataset))
-    metrics = compute_multilevel_classification_metrics(
-        targets=targets,
-        predictions=predictions,
-        probabilities=probabilities,
-        label_names=label_names,
-        source_images=source_images if source_images else None,
-        patch_paths=patch_paths if patch_paths else None,
-        loss=float(test_loss),
-        evaluation_config=evaluation_config,
-    )
+    if task_mode == "mil":
+        image_metrics = compute_classification_metrics(
+            targets=targets,
+            predictions=predictions,
+            probabilities=probabilities,
+            label_names=label_names,
+        )
+        image_metrics["num_samples"] = int(len(targets))
+        image_metrics["sample_level"] = "image"
+        image_metrics["aggregation"] = "attention_mil"
+        metrics = build_single_level_evaluation_result(
+            metrics=image_metrics,
+            loss=float(test_loss),
+            sample_level="image",
+            aggregation="attention_mil",
+        )
+    else:
+        metrics = compute_multilevel_classification_metrics(
+            targets=targets,
+            predictions=predictions,
+            probabilities=probabilities,
+            label_names=label_names,
+            source_images=source_images if source_images else None,
+            patch_paths=patch_paths if patch_paths else None,
+            loss=float(test_loss),
+            evaluation_config=evaluation_config,
+        )
 
     metrics_path = save_metrics_json(metrics, output_dir / "metrics.json")
     logging.info("Saved combined test metrics to %s", metrics_path)
@@ -181,6 +283,7 @@ def run_test_from_checkpoint(
 
     project_root = Path(__file__).resolve().parents[2]
     run_dir = Path(run_dir)
+    task_mode = _get_task_mode(config)
     device = _select_device(config)
     use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
 
@@ -193,22 +296,37 @@ def run_test_from_checkpoint(
     train_csv = split_dir / "train.csv"
     test_csv = split_dir / "test.csv"
 
-    test_loader = build_dataloader(
-        csv_file=test_csv,
-        mode="test",
-        config=config,
-        label_mapping_path=label_mapping_path,
-        project_root=project_root,
-        shuffle=False,
-    )
+    if task_mode == "mil":
+        test_loader = build_mil_dataloader(
+            csv_file=test_csv,
+            mode="test",
+            config=config,
+            label_mapping_path=label_mapping_path,
+            project_root=project_root,
+            shuffle=False,
+        )
+    else:
+        test_loader = build_dataloader(
+            csv_file=test_csv,
+            mode="test",
+            config=config,
+            label_mapping_path=label_mapping_path,
+            project_root=project_root,
+            shuffle=False,
+        )
 
     model = build_model(config).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    class_counts = _compute_class_counts(train_csv)
-    criterion = build_loss(config, class_counts=class_counts, device=device)
     label_names = _load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
+    class_counts = _compute_class_counts(
+        train_csv,
+        task_mode=task_mode,
+        num_classes=config.get("data", {}).get("num_classes"),
+        label_names=label_names,
+    )
+    criterion = build_loss(config, class_counts=class_counts, device=device)
 
     logging.info("Testing checkpoint: %s", checkpoint_path)
     logging.info("Test samples: %s", len(test_loader.dataset))
@@ -222,3 +340,5 @@ def run_test_from_checkpoint(
         use_amp=use_amp,
         evaluation_config=config,
     )
+
+
