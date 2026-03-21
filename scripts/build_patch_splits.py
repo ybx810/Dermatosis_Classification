@@ -23,8 +23,9 @@ REQUIRED_COLUMNS = ["patch_path", "label", "source_image"]
 SPLIT_EXPORT_COLUMNS = ["patch_path", "label", "label_idx", "source_image", "patient_id", "patch_row", "patch_col", "split"]
 SPLIT_NAMES = ("train", "val", "test")
 COVERAGE_SPLITS = ("train", "val", "test")
-LIMITED_GROUP_PRIORITY = ("train", "test", "val")
-EXTRA_GROUP_PRIORITY = ("test", "train", "val")
+LIMITED_IMAGE_PRIORITY = ("train", "test", "val")
+EXTRA_IMAGE_PRIORITY = ("test", "train", "val")
+SPLIT_UNIT = "source_image"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class GroupRecord:
     row_indices: list[int]
     label: str
     patch_count: int
+    source_image: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,9 +155,12 @@ def load_patch_metadata(metadata_path: Path) -> pd.DataFrame:
         dataframe["patient_id"] = ""
 
     dataframe["label"] = dataframe["label"].astype(str)
-    dataframe["source_image"] = dataframe["source_image"].astype(str)
+    dataframe["source_image"] = dataframe["source_image"].fillna("").astype(str).str.strip()
     dataframe["patch_path"] = dataframe["patch_path"].astype(str)
     dataframe["patient_id"] = dataframe["patient_id"].fillna("").astype(str).str.strip()
+
+    if (dataframe["source_image"].str.len() == 0).any():
+        raise ValueError("Patch metadata contains empty source_image values.")
     return dataframe
 
 
@@ -164,39 +169,16 @@ def build_label_mapping(dataframe: pd.DataFrame) -> dict[str, int]:
     return {label: index for index, label in enumerate(labels)}
 
 
-def assign_group_keys(dataframe: pd.DataFrame, group_by: str) -> tuple[pd.DataFrame, str]:
+def assign_group_keys(dataframe: pd.DataFrame, requested_group_by: str) -> tuple[pd.DataFrame, str]:
     dataframe = dataframe.copy()
-    patient_available = dataframe["patient_id"].str.len() > 0
-
-    if group_by == "source_image":
-        dataframe["group_id"] = dataframe["source_image"].map(lambda value: f"source::{value}")
-        return dataframe, "source_image"
-
-    if group_by == "patient_id":
-        if not patient_available.any():
-            logging.warning("No patient_id values found. Falling back to source_image grouping.")
-            dataframe["group_id"] = dataframe["source_image"].map(lambda value: f"source::{value}")
-            return dataframe, "source_image"
-
-        dataframe["group_id"] = dataframe.apply(
-            lambda row: f"patient::{row['patient_id']}" if row["patient_id"] else f"source::{row['source_image']}",
-            axis=1,
+    if requested_group_by != SPLIT_UNIT:
+        logging.warning(
+            "Requested group_by=%s, but split construction is forced to source_image. patient_id is kept only as metadata.",
+            requested_group_by,
         )
-        if (~patient_available).any():
-            logging.warning("Some rows have empty patient_id. Those rows are grouped by source_image.")
-        return dataframe, "patient_id"
-
-    if patient_available.any():
-        dataframe["group_id"] = dataframe.apply(
-            lambda row: f"patient::{row['patient_id']}" if row["patient_id"] else f"source::{row['source_image']}",
-            axis=1,
-        )
-        if (~patient_available).any():
-            logging.warning("patient_id is partially missing. Falling back to source_image for rows without patient_id.")
-        return dataframe, "patient_id(auto)"
 
     dataframe["group_id"] = dataframe["source_image"].map(lambda value: f"source::{value}")
-    return dataframe, "source_image(auto)"
+    return dataframe, SPLIT_UNIT
 
 
 def build_group_records(dataframe: pd.DataFrame) -> list[GroupRecord]:
@@ -204,11 +186,15 @@ def build_group_records(dataframe: pd.DataFrame) -> list[GroupRecord]:
     for group_id, group_df in dataframe.groupby("group_id", sort=True):
         labels = sorted(group_df["label"].astype(str).unique().tolist())
         if len(labels) != 1:
+            source_images = sorted(group_df["source_image"].astype(str).unique().tolist())
             raise ValueError(
-                "Each group must contain exactly one class label for explicit per-class allocation. "
-                f"group_id={group_id!r}, labels={labels}. "
-                "If group_by=patient_id causes multi-class groups, please split patients differently or use source_image grouping."
+                "Each source_image must contain exactly one class label. "
+                f"group_id={group_id!r}, source_images={source_images}, labels={labels}"
             )
+
+        source_images = sorted(group_df["source_image"].astype(str).unique().tolist())
+        if len(source_images) != 1:
+            raise RuntimeError(f"Internal grouping error: group_id {group_id!r} contains multiple source_image values {source_images}")
 
         group_records.append(
             GroupRecord(
@@ -216,6 +202,7 @@ def build_group_records(dataframe: pd.DataFrame) -> list[GroupRecord]:
                 row_indices=group_df.index.to_list(),
                 label=labels[0],
                 patch_count=len(group_df),
+                source_image=source_images[0],
             )
         )
     return group_records
@@ -245,9 +232,6 @@ def allocate_remainder_by_priority(
     remainder: int,
     priority: tuple[str, ...],
 ) -> None:
-    if remainder <= 0:
-        return
-
     priority_index = 0
     while remainder > 0:
         split_name = priority[priority_index % len(priority)]
@@ -256,15 +240,15 @@ def allocate_remainder_by_priority(
         priority_index += 1
 
 
-def select_splits_for_limited_groups(num_groups: int, split_ratios: dict[str, float]) -> list[str]:
+def select_splits_for_limited_images(num_groups: int, split_ratios: dict[str, float]) -> list[str]:
     ordered_splits = sorted(
         SPLIT_NAMES,
-        key=lambda split_name: (-split_ratios[split_name], LIMITED_GROUP_PRIORITY.index(split_name)),
+        key=lambda split_name: (-split_ratios[split_name], LIMITED_IMAGE_PRIORITY.index(split_name)),
     )
     return ordered_splits[:num_groups]
 
 
-def plan_class_group_allocation(
+def plan_class_image_allocation(
     label: str,
     num_groups: int,
     split_ratios: dict[str, float],
@@ -275,34 +259,27 @@ def plan_class_group_allocation(
     counts = {split_name: 0 for split_name in SPLIT_NAMES}
 
     if num_groups == 1:
-        selected_split = select_splits_for_limited_groups(num_groups, split_ratios)[0]
+        selected_split = select_splits_for_limited_images(num_groups, split_ratios)[0]
         counts[selected_split] = 1
         logging.warning(
-            "Label '%s' has only 1 group. Cannot cover train/val/test simultaneously; assigning to %s only.",
+            "Label '%s' has only 1 source_image. Cannot cover train/val/test simultaneously; assigning to %s only.",
             label,
             selected_split,
         )
         return counts
 
     if num_groups == 2:
-        selected_splits = select_splits_for_limited_groups(num_groups, split_ratios)
+        selected_splits = select_splits_for_limited_images(num_groups, split_ratios)
         for split_name in selected_splits:
             counts[split_name] += 1
         logging.warning(
-            "Label '%s' has only 2 groups. Cannot cover all three splits; assigning to %s.",
+            "Label '%s' has only 2 source_image entries. Cannot cover all three splits; assigning to %s.",
             label,
             selected_splits,
         )
         return counts
 
     for split_name in COVERAGE_SPLITS:
-        if split_ratios[split_name] <= 0:
-            logging.warning(
-                "Label '%s' has %s groups, so split coverage overrides the non-positive %s ratio.",
-                label,
-                num_groups,
-                split_name,
-            )
         counts[split_name] = 1
 
     remaining_groups = num_groups - len(COVERAGE_SPLITS)
@@ -315,11 +292,11 @@ def plan_class_group_allocation(
 
     allocated_groups = len(COVERAGE_SPLITS) + sum(base_allocations.values())
     remainder = num_groups - allocated_groups
-    allocate_remainder_by_priority(counts, remainder, EXTRA_GROUP_PRIORITY)
+    allocate_remainder_by_priority(counts, remainder, EXTRA_IMAGE_PRIORITY)
 
     if sum(counts.values()) != num_groups:
         raise RuntimeError(
-            f"Internal allocation error for label {label!r}: expected {num_groups} groups, got {counts}"
+            f"Internal allocation error for label {label!r}: expected {num_groups} source_image entries, got {counts}"
         )
     return counts
 
@@ -333,20 +310,20 @@ def assign_groups_to_splits(
     rng = random.Random(config.seed)
 
     group_to_split: dict[str, str] = {}
-    per_class_group_distribution: dict[str, dict[str, int]] = {}
-    per_class_group_counts: dict[str, int] = {}
+    per_class_image_distribution: dict[str, dict[str, int]] = {}
+    per_class_image_counts: dict[str, int] = {}
 
     for label in sorted(groups_by_label):
         label_groups = list(groups_by_label[label])
         rng.shuffle(label_groups)
 
-        per_class_group_counts[label] = len(label_groups)
-        split_counts = plan_class_group_allocation(
+        per_class_image_counts[label] = len(label_groups)
+        split_counts = plan_class_image_allocation(
             label=label,
             num_groups=len(label_groups),
             split_ratios=split_ratios,
         )
-        per_class_group_distribution[label] = dict(split_counts)
+        per_class_image_distribution[label] = dict(split_counts)
 
         start_index = 0
         for split_name in SPLIT_NAMES:
@@ -360,16 +337,14 @@ def assign_groups_to_splits(
 
         if start_index != len(label_groups):
             raise RuntimeError(
-                f"Label '{label}' allocation did not consume all groups: consumed={start_index}, total={len(label_groups)}"
+                f"Label '{label}' allocation did not consume all source_image groups: consumed={start_index}, total={len(label_groups)}"
             )
 
-    return group_to_split, per_class_group_distribution, per_class_group_counts
+    return group_to_split, per_class_image_distribution, per_class_image_counts
 
 
 def validate_patch_split_consistency(dataframe: pd.DataFrame) -> None:
     for group_column in ["group_id", "source_image"]:
-        if group_column not in dataframe.columns:
-            continue
         split_counts = dataframe.groupby(group_column)["split"].nunique()
         inconsistent = split_counts[split_counts > 1]
         if not inconsistent.empty:
@@ -388,18 +363,23 @@ def format_distribution(counter: Counter) -> dict[str, int]:
     return {label: int(count) for label, count in sorted(counter.items())}
 
 
-def compute_per_class_group_distribution(dataframe: pd.DataFrame) -> dict[str, dict[str, int]]:
+def compute_per_class_image_distribution(dataframe: pd.DataFrame) -> dict[str, dict[str, int]]:
     distribution: dict[str, dict[str, int]] = {}
     for label in sorted(dataframe["label"].astype(str).unique().tolist()):
         label_df = dataframe[dataframe["label"].astype(str) == label]
         distribution[label] = {
-            split_name: int(label_df[label_df["split"] == split_name]["group_id"].nunique())
+            split_name: int(label_df[label_df["split"] == split_name]["source_image"].nunique())
             for split_name in SPLIT_NAMES
         }
     return distribution
 
 
-def summarize_splits(dataframe: pd.DataFrame, grouping_strategy: str, seed: int) -> dict[str, Any]:
+def summarize_splits(
+    dataframe: pd.DataFrame,
+    requested_group_by: str,
+    effective_group_by: str,
+    seed: int,
+) -> dict[str, Any]:
     split_summaries: dict[str, dict[str, Any]] = {}
     for split_name in SPLIT_NAMES:
         split_df = dataframe[dataframe["split"] == split_name]
@@ -413,17 +393,19 @@ def summarize_splits(dataframe: pd.DataFrame, grouping_strategy: str, seed: int)
 
         split_summaries[split_name] = {
             "num_patches": int(len(split_df)),
-            "num_groups": int(split_df["group_id"].nunique()),
+            "num_groups": int(split_df["source_image"].nunique()),
             "label_distribution": format_distribution(Counter(split_df["label"].tolist())),
         }
 
     return {
         "seed": seed,
-        "grouping_strategy": grouping_strategy,
+        "split_unit": SPLIT_UNIT,
+        "requested_group_by": requested_group_by,
+        "effective_group_by": effective_group_by,
         "total_patches": int(len(dataframe)),
-        "total_groups": int(dataframe["group_id"].nunique()),
+        "total_groups": int(dataframe["source_image"].nunique()),
         "label_distribution": format_distribution(Counter(dataframe["label"].tolist())),
-        "per_class_group_distribution": compute_per_class_group_distribution(dataframe),
+        "per_class_image_distribution": compute_per_class_image_distribution(dataframe),
         "splits": split_summaries,
     }
 
@@ -437,17 +419,17 @@ def save_label_mapping(label_mapping: dict[str, int], path: Path) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def log_per_class_group_summary(
-    per_class_group_counts: dict[str, int],
-    per_class_group_distribution: dict[str, dict[str, int]],
+def log_per_class_image_summary(
+    per_class_image_counts: dict[str, int],
+    per_class_image_distribution: dict[str, dict[str, int]],
 ) -> None:
-    logging.info("Per-class group counts:")
-    for label in sorted(per_class_group_counts):
-        logging.info("  %s | groups=%s", label, per_class_group_counts[label])
+    logging.info("Per-class source_image counts:")
+    for label in sorted(per_class_image_counts):
+        logging.info("  %s | source_images=%s", label, per_class_image_counts[label])
 
-    logging.info("Per-class split allocation (group counts):")
-    for label in sorted(per_class_group_distribution):
-        distribution = per_class_group_distribution[label]
+    logging.info("Per-class split allocation (source_image counts):")
+    for label in sorted(per_class_image_distribution):
+        distribution = per_class_image_distribution[label]
         logging.info(
             "  %s | train=%s val=%s test=%s",
             label,
@@ -458,15 +440,17 @@ def log_per_class_group_summary(
 
 
 def log_split_summary(summary: dict[str, Any]) -> None:
-    logging.info("Grouping strategy: %s", summary["grouping_strategy"])
+    logging.info("Split unit: %s", summary["split_unit"])
+    logging.info("Requested group_by: %s", summary["requested_group_by"])
+    logging.info("Effective group_by: %s", summary["effective_group_by"])
     logging.info("Total patches: %s", summary["total_patches"])
-    logging.info("Total groups: %s", summary["total_groups"])
+    logging.info("Total source_image groups: %s", summary["total_groups"])
     logging.info("Overall label distribution: %s", summary["label_distribution"])
 
     for split_name in SPLIT_NAMES:
         split_summary = summary["splits"][split_name]
         logging.info(
-            "%s | patches=%s groups=%s label_distribution=%s",
+            "%s | patches=%s source_images=%s label_distribution=%s",
             split_name,
             split_summary["num_patches"],
             split_summary["num_groups"],
@@ -484,13 +468,13 @@ def export_split_files(dataframe: pd.DataFrame, output_dir: Path) -> None:
 
 def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
     dataframe = load_patch_metadata(config.metadata_path)
-    dataframe, grouping_strategy = assign_group_keys(dataframe, config.group_by)
+    dataframe, effective_group_by = assign_group_keys(dataframe, config.group_by)
 
     label_mapping = build_label_mapping(dataframe)
     dataframe["label_idx"] = dataframe["label"].map(label_mapping)
 
     group_records = build_group_records(dataframe)
-    group_to_split, per_class_group_distribution, per_class_group_counts = assign_groups_to_splits(
+    group_to_split, per_class_image_distribution, per_class_image_counts = assign_groups_to_splits(
         group_records=group_records,
         config=config,
     )
@@ -498,7 +482,7 @@ def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
 
     if dataframe["split"].isna().any():
         missing_groups = sorted(dataframe.loc[dataframe["split"].isna(), "group_id"].astype(str).unique().tolist())
-        raise RuntimeError(f"Some groups were not assigned to any split: {missing_groups[:10]}")
+        raise RuntimeError(f"Some source_image groups were not assigned to any split: {missing_groups[:10]}")
 
     validate_patch_split_consistency(dataframe)
 
@@ -516,12 +500,17 @@ def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
     export_split_files(dataframe, config.output_dir)
     save_label_mapping(label_mapping, config.label_mapping_path)
 
-    summary = summarize_splits(dataframe, grouping_strategy, config.seed)
+    summary = summarize_splits(
+        dataframe=dataframe,
+        requested_group_by=config.group_by,
+        effective_group_by=effective_group_by,
+        seed=config.seed,
+    )
     if config.summary_path is not None:
         config.summary_path.parent.mkdir(parents=True, exist_ok=True)
         config.summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    log_per_class_group_summary(per_class_group_counts, per_class_group_distribution)
+    log_per_class_image_summary(per_class_image_counts, per_class_image_distribution)
     log_split_summary(summary)
     logging.info("Saved all patches file to %s", config.all_patches_path)
     logging.info("Saved label mapping to %s", config.label_mapping_path)
@@ -531,21 +520,33 @@ def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
 def run_allocation_self_checks() -> None:
     split_ratios = {"train": 0.7, "val": 0.15, "test": 0.15}
 
-    counts_three = plan_class_group_allocation("three_case", 3, split_ratios)
+    counts_three = plan_class_image_allocation("three_case", 3, split_ratios)
     assert counts_three == {"train": 1, "val": 1, "test": 1}, counts_three
 
-    counts_four = plan_class_group_allocation("four_case", 4, split_ratios)
+    counts_four = plan_class_image_allocation("four_case", 4, split_ratios)
     assert counts_four == {"train": 1, "val": 1, "test": 2}, counts_four
 
-    counts_two = plan_class_group_allocation("two_case", 2, split_ratios)
+    counts_two = plan_class_image_allocation("two_case", 2, split_ratios)
     assert counts_two == {"train": 1, "val": 0, "test": 1}, counts_two
+
+    patient_mixed_df = pd.DataFrame(
+        [
+            {"patch_path": "a1.png", "label": "A", "source_image": "img_a", "patient_id": "p1"},
+            {"patch_path": "a2.png", "label": "A", "source_image": "img_a", "patient_id": "p1"},
+            {"patch_path": "b1.png", "label": "B", "source_image": "img_b", "patient_id": "p1"},
+            {"patch_path": "b2.png", "label": "B", "source_image": "img_b", "patient_id": "p1"},
+        ]
+    )
+    grouped_df, effective_group_by = assign_group_keys(patient_mixed_df, "patient_id")
+    assert effective_group_by == "source_image", effective_group_by
+    build_group_records(grouped_df)
 
     inheritance_df = pd.DataFrame(
         [
-            {"patch_path": "a_patch_1.png", "label": "A", "source_image": "img_a", "group_id": "group_a", "split": "train"},
-            {"patch_path": "a_patch_2.png", "label": "A", "source_image": "img_a", "group_id": "group_a", "split": "train"},
-            {"patch_path": "b_patch_1.png", "label": "B", "source_image": "img_b", "group_id": "group_b", "split": "test"},
-            {"patch_path": "b_patch_2.png", "label": "B", "source_image": "img_b", "group_id": "group_b", "split": "test"},
+            {"patch_path": "a_patch_1.png", "label": "A", "source_image": "img_a", "group_id": "source::img_a", "split": "train"},
+            {"patch_path": "a_patch_2.png", "label": "A", "source_image": "img_a", "group_id": "source::img_a", "split": "train"},
+            {"patch_path": "b_patch_1.png", "label": "B", "source_image": "img_b", "group_id": "source::img_b", "split": "test"},
+            {"patch_path": "b_patch_2.png", "label": "B", "source_image": "img_b", "group_id": "source::img_b", "split": "test"},
         ]
     )
     validate_patch_split_consistency(inheritance_df)

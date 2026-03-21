@@ -7,17 +7,17 @@ task:
   mode: mil
 
 data:
-  raw_dir: E:\skin-image-classification\data\raw\18disease_full
+  raw_dir: data/raw/16disease_full
   patch_dir: data/patches
   metadata_dir: data/metadata
   split_dir: data/splits
   cache_dir: data/cache
   patch_size: 512
-  num_classes: 18
+  num_classes: 16
   image_extension: .png
 
 prepare_patches:
-  raw_dir: E:\skin-image-classification\data\raw\18disease_full
+  raw_dir: data/raw/16disease_full
   output_dir: data/cache/patches
   metadata_path: data/metadata/patch_metadata.csv
   summary_path: data/metadata/patch_summary.json
