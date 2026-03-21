@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from collections import Counter
@@ -287,6 +287,80 @@ def aggregate_patch_predictions_to_image(
     }
 
 
+def aggregate_bag_logits_to_image(
+    logits: list[list[float]] | np.ndarray,
+    targets: list[int] | np.ndarray,
+    source_images: list[str],
+    bag_indices: list[int] | np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Aggregate multiple MIL sub-bag logits into image-level logits by source_image."""
+
+    y_logits = np.asarray(logits, dtype=np.float64)
+    y_true = np.asarray(targets, dtype=np.int64)
+    if y_logits.ndim != 2:
+        raise ValueError("logits must have shape [num_bags, num_classes].")
+    if y_logits.shape[0] != y_true.shape[0]:
+        raise ValueError("logits and targets must have the same number of rows for MIL aggregation.")
+    if y_true.shape[0] != len(source_images):
+        raise ValueError("source_images length must match the number of MIL bag predictions.")
+    if bag_indices is not None and len(bag_indices) != y_true.shape[0]:
+        raise ValueError("bag_indices length must match the number of MIL bag predictions.")
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for index, source_image in enumerate(source_images):
+        normalized_source = str(source_image).strip()
+        if not normalized_source:
+            raise ValueError(f"Missing source_image for MIL bag prediction at index {index}.")
+
+        record = grouped.setdefault(
+            normalized_source,
+            {
+                "target": int(y_true[index]),
+                "logits": [],
+                "bag_indices": [],
+            },
+        )
+        target_value = int(y_true[index])
+        if record["target"] != target_value:
+            raise ValueError(
+                "Inconsistent labels found for source_image "
+                f"'{normalized_source}': {record['target']} vs {target_value}."
+            )
+
+        record["logits"].append(y_logits[index])
+        if bag_indices is not None:
+            record["bag_indices"].append(int(bag_indices[index]))
+
+    image_targets: list[int] = []
+    image_logits: list[list[float]] = []
+    ordered_source_images: list[str] = []
+    bag_counts: list[int] = []
+
+    for source_image, record in grouped.items():
+        bag_logits = record["logits"]
+        if record["bag_indices"]:
+            ordered_pairs = sorted(
+                zip(record["bag_indices"], bag_logits),
+                key=lambda item: item[0],
+            )
+            bag_logits = [logit for _, logit in ordered_pairs]
+
+        bag_logits_array = np.asarray(bag_logits, dtype=np.float64)
+        aggregated_logits = np.mean(bag_logits_array, axis=0)
+
+        ordered_source_images.append(source_image)
+        image_targets.append(int(record["target"]))
+        image_logits.append(aggregated_logits.astype(np.float64).tolist())
+        bag_counts.append(int(bag_logits_array.shape[0]))
+
+    return {
+        "source_images": ordered_source_images,
+        "targets": image_targets,
+        "logits": image_logits,
+        "bag_counts": bag_counts,
+    }
+
+
 def compute_multilevel_classification_metrics(
     targets: list[int] | np.ndarray,
     predictions: list[int] | np.ndarray,
@@ -491,3 +565,4 @@ def save_metrics_json(metrics: dict[str, Any], output_path: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     return output_path
+

@@ -303,6 +303,38 @@ def _build_train_and_val_loaders(
     return train_loader, val_loader
 
 
+def _log_mil_dataset_statistics(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: torch.utils.data.DataLoader,
+    config: dict[str, Any],
+) -> None:
+    mil_config = config.get("mil", {})
+    aggregate_logits = str(mil_config.get("aggregate_logits", "mean")).lower()
+    logging.info(
+        "MIL mode enabled | bag_size=%s drop_last_incomplete_bag=%s shuffle_instances_within_image=%s aggregate_logits=%s",
+        mil_config.get("bag_size", 512),
+        mil_config.get("drop_last_incomplete_bag", False),
+        mil_config.get("shuffle_instances_within_image", True),
+        aggregate_logits,
+    )
+
+    for split_name, loader in (("Train", train_loader), ("Val", val_loader)):
+        stats_fn = getattr(loader.dataset, "get_statistics", None)
+        if not callable(stats_fn):
+            continue
+        stats = stats_fn()
+        logging.info(
+            "%s bags=%s source_images=%s avg_bags_per_image=%.2f avg_instances_per_bag=%.2f min_instances=%s max_instances=%s",
+            split_name,
+            stats["num_bags"],
+            stats["num_source_images"],
+            stats["avg_bags_per_image"],
+            stats["avg_instances_per_bag"],
+            stats["min_instances_per_bag"],
+            stats["max_instances_per_bag"],
+        )
+
+
 def run_training(config: dict[str, Any]) -> Path:
     seed = int(config.get("train", {}).get("seed", 42))
     seed_everything(seed)
@@ -343,18 +375,18 @@ def run_training(config: dict[str, Any]) -> Path:
 
     logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
-    logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
     if task_mode == "mil":
+        logging.info("Train bags: %s | Val bags: %s", len(train_loader.dataset), len(val_loader.dataset))
+        _log_mil_dataset_statistics(train_loader=train_loader, val_loader=val_loader, config=config)
         logging.info(
-            "MIL config: max_instances_per_bag=%s min_instances_per_bag=%s sample_strategy=%s embedding_dim=%s attention_hidden_dim=%s dropout=%s",
-            config.get("mil", {}).get("max_instances_per_bag"),
-            config.get("mil", {}).get("min_instances_per_bag", 1),
-            config.get("mil", {}).get("sample_strategy", "none"),
+            "MIL model config: embedding_dim=%s attention_hidden_dim=%s dropout=%s return_attention=%s",
             config.get("mil", {}).get("embedding_dim", 256),
             config.get("mil", {}).get("attention_hidden_dim", 128),
             config.get("mil", {}).get("dropout", config.get("model", {}).get("dropout", 0.0)),
+            config.get("mil", {}).get("return_attention", False),
         )
     else:
+        logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
         logging.info(
             "Evaluation: level=%s aggregation=%s",
             config.get("evaluation", {}).get("level", "both"),
@@ -470,5 +502,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 

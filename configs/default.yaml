@@ -1,4 +1,4 @@
-project:
+﻿project:
   name: large-medical-image-patch-classification
   task: patch-classification
   output_dir: outputs
@@ -52,9 +52,13 @@ evaluation:
 
 mil:
   enabled: true
-  max_instances_per_bag: 64
+  bag_size: 512
+  drop_last_incomplete_bag: false
+  shuffle_instances_within_image: true
+  aggregate_logits: mean
+  max_instances_per_bag:
   min_instances_per_bag: 1
-  sample_strategy: random
+  sample_strategy: none
   embedding_dim: 256
   attention_hidden_dim: 128
   dropout: 0.3

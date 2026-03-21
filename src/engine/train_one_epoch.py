@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any
 
@@ -39,6 +39,20 @@ def _move_bag_batch_to_device(bag_batch: list[torch.Tensor], device: torch.devic
     return [bag.to(device, non_blocking=True) for bag in bag_batch]
 
 
+def _refresh_mil_bag_metadata(
+    dataloader: torch.utils.data.DataLoader,
+    epoch: int,
+    mode: str,
+) -> None:
+    if mode != "mil":
+        return
+
+    dataset = getattr(dataloader, "dataset", None)
+    refresh_fn = getattr(dataset, "refresh_bag_metadata", None)
+    if callable(refresh_fn):
+        refresh_fn(epoch=epoch)
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -54,6 +68,8 @@ def train_one_epoch(
     model.train()
 
     mode = _get_task_mode(task_mode=task_mode, config=config)
+    _refresh_mil_bag_metadata(dataloader=dataloader, epoch=epoch, mode=mode)
+
     running_loss = 0.0
     predictions: list[int] = []
     targets: list[int] = []

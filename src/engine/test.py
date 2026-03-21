@@ -15,13 +15,13 @@ from src.datasets.skin_patch_dataset import build_dataloader
 from src.losses import build_loss
 from src.models import build_model
 from src.utils.metrics import (
+    aggregate_bag_logits_to_image,
     build_single_level_evaluation_result,
     compute_classification_metrics,
     compute_multilevel_classification_metrics,
     save_confusion_matrix_figure,
     save_metrics_json,
 )
-
 
 
 def _resolve_path(project_root: Path, path_value: str | Path | None) -> Path | None:
@@ -33,7 +33,6 @@ def _resolve_path(project_root: Path, path_value: str | Path | None) -> Path | N
     return project_root / path
 
 
-
 def _get_task_mode(config: dict[str, Any]) -> str:
     task_config = config.get("task", {})
     mode = str(task_config.get("mode", "patch")).lower() if isinstance(task_config, dict) else "patch"
@@ -42,13 +41,11 @@ def _get_task_mode(config: dict[str, Any]) -> str:
     return mode
 
 
-
 def _select_device(config: dict[str, Any]) -> torch.device:
     requested = str(config.get("train", {}).get("device", "cuda")).lower()
     if requested == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
 
 
 def _compute_class_counts(
@@ -121,7 +118,6 @@ def _compute_class_counts(
     return [int(counts.get(label, 0)) for label in labels]
 
 
-
 def _load_label_names(label_mapping_path: Path | None, num_classes: int | None = None) -> list[str] | None:
     if label_mapping_path is None or not label_mapping_path.exists():
         return None
@@ -140,7 +136,6 @@ def _load_label_names(label_mapping_path: Path | None, num_classes: int | None =
     return None
 
 
-
 def _save_level_artifacts(metrics: dict[str, Any], output_dir: Path, prefix: str) -> None:
     metrics_path = save_metrics_json(metrics, output_dir / f"{prefix}_metrics.json")
     confusion_path = save_confusion_matrix_figure(
@@ -152,9 +147,26 @@ def _save_level_artifacts(metrics: dict[str, Any], output_dir: Path, prefix: str
     logging.info("Saved %s confusion matrix to %s", prefix, confusion_path)
 
 
-
 def _move_bag_batch_to_device(bag_batch: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
     return [bag.to(device, non_blocking=True) for bag in bag_batch]
+
+
+def _resolve_mil_aggregation(config: dict[str, Any] | None = None) -> str:
+    mil_config = {} if config is None else config.get("mil", {})
+    aggregation = str(mil_config.get("aggregate_logits", "mean")).lower()
+    if aggregation != "mean":
+        raise ValueError(f"Unsupported mil.aggregate_logits: {aggregation}. Currently supported: mean")
+    return aggregation
+
+
+def _summarize_counts(counts: list[int]) -> dict[str, float | int]:
+    if not counts:
+        return {"min": 0, "max": 0, "mean": 0.0}
+    return {
+        "min": int(min(counts)),
+        "max": int(max(counts)),
+        "mean": float(sum(counts) / len(counts)),
+    }
 
 
 @torch.no_grad()
@@ -181,6 +193,10 @@ def test_model(
     probabilities: list[list[float]] = []
     source_images: list[str] = []
     patch_paths: list[str] = []
+    bag_logits: list[list[float]] = []
+    bag_targets: list[int] = []
+    bag_source_images: list[str] = []
+    bag_indices: list[int] = []
 
     progress = tqdm(dataloader, desc="Test", leave=False)
     for batch in progress:
@@ -190,22 +206,27 @@ def test_model(
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 logits = model(bag_images, return_attention=False)
-                loss = criterion(logits, labels)
+                bag_loss = criterion(logits, labels)
 
-            batch_size = labels.size(0)
-        else:
-            images = batch["image"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
+            bag_logits.extend(logits.detach().float().cpu().tolist())
+            bag_targets.extend(labels.detach().cpu().tolist())
+            bag_source_images.extend([str(value) for value in batch["source_image"]])
+            bag_indices.extend(batch["bag_index"].detach().cpu().tolist())
+            progress.set_postfix(loss=f"{bag_loss.detach().item():.4f}")
+            continue
 
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                logits = model(images)
-                loss = criterion(logits, labels)
+        images = batch["image"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
 
-            batch_size = images.size(0)
-            if "source_image" in batch:
-                source_images.extend([str(value) for value in batch["source_image"]])
-            if "patch_path" in batch:
-                patch_paths.extend([str(value) for value in batch["patch_path"]])
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+        batch_size = images.size(0)
+        if "source_image" in batch:
+            source_images.extend([str(value) for value in batch["source_image"]])
+        if "patch_path" in batch:
+            patch_paths.extend([str(value) for value in batch["patch_path"]])
 
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(probs, dim=1)
@@ -216,24 +237,49 @@ def test_model(
         probabilities.extend(probs.cpu().tolist())
         progress.set_postfix(loss=f"{loss.detach().item():.4f}")
 
-    test_loss = running_loss / max(1, len(dataloader.dataset))
     if task_mode == "mil":
+        aggregation = _resolve_mil_aggregation(evaluation_config)
+        aggregated = aggregate_bag_logits_to_image(
+            logits=bag_logits,
+            targets=bag_targets,
+            source_images=bag_source_images,
+            bag_indices=bag_indices,
+        )
+
+        if aggregated["logits"]:
+            image_logits_tensor = torch.tensor(aggregated["logits"], dtype=torch.float32, device=device)
+            image_labels_tensor = torch.tensor(aggregated["targets"], dtype=torch.long, device=device)
+            image_loss = float(criterion(image_logits_tensor, image_labels_tensor).item())
+            image_probabilities_tensor = torch.softmax(image_logits_tensor, dim=1)
+            image_predictions = torch.argmax(image_probabilities_tensor, dim=1).cpu().tolist()
+            image_probabilities = image_probabilities_tensor.cpu().tolist()
+        else:
+            image_loss = 0.0
+            image_predictions = []
+            image_probabilities = []
+
         image_metrics = compute_classification_metrics(
-            targets=targets,
-            predictions=predictions,
-            probabilities=probabilities,
+            targets=aggregated["targets"],
+            predictions=image_predictions,
+            probabilities=image_probabilities,
             label_names=label_names,
         )
-        image_metrics["num_samples"] = int(len(targets))
+        image_metrics["num_samples"] = int(len(aggregated["targets"]))
         image_metrics["sample_level"] = "image"
-        image_metrics["aggregation"] = "attention_mil"
+        image_metrics["aggregation"] = f"{aggregation}_logits"
+        image_metrics["num_bags"] = int(len(bag_targets))
+        image_metrics["bags_per_image"] = _summarize_counts(aggregated["bag_counts"])
+
         metrics = build_single_level_evaluation_result(
             metrics=image_metrics,
-            loss=float(test_loss),
+            loss=float(image_loss),
             sample_level="image",
-            aggregation="attention_mil",
+            aggregation=f"{aggregation}_logits",
         )
+        metrics["num_bags"] = int(len(bag_targets))
+        metrics["bags_per_image"] = image_metrics["bags_per_image"]
     else:
+        test_loss = running_loss / max(1, len(dataloader.dataset))
         metrics = compute_multilevel_classification_metrics(
             targets=targets,
             predictions=predictions,
@@ -271,7 +317,6 @@ def test_model(
             metrics["image_macro_f1"],
         )
     return metrics
-
 
 
 def run_test_from_checkpoint(
@@ -329,7 +374,20 @@ def run_test_from_checkpoint(
     criterion = build_loss(config, class_counts=class_counts, device=device)
 
     logging.info("Testing checkpoint: %s", checkpoint_path)
-    logging.info("Test samples: %s", len(test_loader.dataset))
+    if task_mode == "mil" and hasattr(test_loader.dataset, "get_statistics"):
+        stats = test_loader.dataset.get_statistics()
+        logging.info(
+            "Test bags: %s | Test source_images: %s | Avg bags/image: %.2f | Avg instances/bag: %.2f | Min/Max instances: %s/%s",
+            stats["num_bags"],
+            stats["num_source_images"],
+            stats["avg_bags_per_image"],
+            stats["avg_instances_per_bag"],
+            stats["min_instances_per_bag"],
+            stats["max_instances_per_bag"],
+        )
+    else:
+        logging.info("Test samples: %s", len(test_loader.dataset))
+
     return test_model(
         model=model,
         dataloader=test_loader,
@@ -340,5 +398,3 @@ def run_test_from_checkpoint(
         use_amp=use_amp,
         evaluation_config=config,
     )
-
-
