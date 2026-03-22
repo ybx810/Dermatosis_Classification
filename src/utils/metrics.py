@@ -101,48 +101,6 @@ def compute_classification_metrics(
     return metrics
 
 
-def build_single_level_evaluation_result(
-    metrics: dict[str, Any],
-    loss: float | None = None,
-    sample_level: str = "image",
-    aggregation: str | None = None,
-) -> dict[str, Any]:
-    if sample_level not in {"patch", "image"}:
-        raise ValueError(f"sample_level must be 'patch' or 'image', got: {sample_level}")
-
-    metrics_payload = dict(metrics)
-    metrics_payload["loss"] = float(loss) if loss is not None else metrics_payload.get("loss")
-    metrics_payload["num_samples"] = int(metrics_payload.get("num_samples", 0))
-    metrics_payload["sample_level"] = sample_level
-    if aggregation is not None:
-        metrics_payload["aggregation"] = aggregation
-
-    result: dict[str, Any] = {
-        "loss": metrics_payload["loss"],
-        "num_samples": metrics_payload["num_samples"],
-        "evaluation_level": sample_level,
-        "aggregation": aggregation or sample_level,
-        "primary_metric_level": sample_level,
-        "accuracy": float(metrics_payload["accuracy"]),
-        "precision": float(metrics_payload["precision"]),
-        "recall": float(metrics_payload["recall"]),
-        "macro_f1": float(metrics_payload["macro_f1"]),
-        "auc_ovr": metrics_payload.get("auc_ovr"),
-        "confusion_matrix": metrics_payload["confusion_matrix"],
-        "labels": metrics_payload["labels"],
-        f"{sample_level}_metrics": metrics_payload,
-        f"{sample_level}_accuracy": float(metrics_payload["accuracy"]),
-        f"{sample_level}_precision": float(metrics_payload["precision"]),
-        f"{sample_level}_recall": float(metrics_payload["recall"]),
-        f"{sample_level}_macro_f1": float(metrics_payload["macro_f1"]),
-        f"{sample_level}_auc_ovr": metrics_payload.get("auc_ovr"),
-        f"{sample_level}_confusion_matrix": metrics_payload["confusion_matrix"],
-    }
-    if sample_level == "image":
-        result["num_images"] = metrics_payload["num_samples"]
-    return result
-
-
 def resolve_evaluation_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     evaluation_config = dict(DEFAULT_EVALUATION_CONFIG)
     if config is not None:
@@ -284,80 +242,6 @@ def aggregate_patch_predictions_to_image(
         "predictions": image_predictions,
         "probabilities": image_probabilities,
         "patch_counts": patch_counts,
-    }
-
-
-def aggregate_bag_logits_to_image(
-    logits: list[list[float]] | np.ndarray,
-    targets: list[int] | np.ndarray,
-    source_images: list[str],
-    bag_indices: list[int] | np.ndarray | None = None,
-) -> dict[str, Any]:
-    """Aggregate multiple MIL sub-bag logits into image-level logits by source_image."""
-
-    y_logits = np.asarray(logits, dtype=np.float64)
-    y_true = np.asarray(targets, dtype=np.int64)
-    if y_logits.ndim != 2:
-        raise ValueError("logits must have shape [num_bags, num_classes].")
-    if y_logits.shape[0] != y_true.shape[0]:
-        raise ValueError("logits and targets must have the same number of rows for MIL aggregation.")
-    if y_true.shape[0] != len(source_images):
-        raise ValueError("source_images length must match the number of MIL bag predictions.")
-    if bag_indices is not None and len(bag_indices) != y_true.shape[0]:
-        raise ValueError("bag_indices length must match the number of MIL bag predictions.")
-
-    grouped: dict[str, dict[str, Any]] = {}
-    for index, source_image in enumerate(source_images):
-        normalized_source = str(source_image).strip()
-        if not normalized_source:
-            raise ValueError(f"Missing source_image for MIL bag prediction at index {index}.")
-
-        record = grouped.setdefault(
-            normalized_source,
-            {
-                "target": int(y_true[index]),
-                "logits": [],
-                "bag_indices": [],
-            },
-        )
-        target_value = int(y_true[index])
-        if record["target"] != target_value:
-            raise ValueError(
-                "Inconsistent labels found for source_image "
-                f"'{normalized_source}': {record['target']} vs {target_value}."
-            )
-
-        record["logits"].append(y_logits[index])
-        if bag_indices is not None:
-            record["bag_indices"].append(int(bag_indices[index]))
-
-    image_targets: list[int] = []
-    image_logits: list[list[float]] = []
-    ordered_source_images: list[str] = []
-    bag_counts: list[int] = []
-
-    for source_image, record in grouped.items():
-        bag_logits = record["logits"]
-        if record["bag_indices"]:
-            ordered_pairs = sorted(
-                zip(record["bag_indices"], bag_logits),
-                key=lambda item: item[0],
-            )
-            bag_logits = [logit for _, logit in ordered_pairs]
-
-        bag_logits_array = np.asarray(bag_logits, dtype=np.float64)
-        aggregated_logits = np.mean(bag_logits_array, axis=0)
-
-        ordered_source_images.append(source_image)
-        image_targets.append(int(record["target"]))
-        image_logits.append(aggregated_logits.astype(np.float64).tolist())
-        bag_counts.append(int(bag_logits_array.shape[0]))
-
-    return {
-        "source_images": ordered_source_images,
-        "targets": image_targets,
-        "logits": image_logits,
-        "bag_counts": bag_counts,
     }
 
 
@@ -565,4 +449,3 @@ def save_metrics_json(metrics: dict[str, Any], output_path: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     return output_path
-

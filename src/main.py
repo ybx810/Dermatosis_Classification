@@ -17,7 +17,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.datasets.skin_mil_dataset import build_mil_dataloader
 from src.datasets.skin_patch_dataset import build_dataloader
 from src.engine import train_one_epoch, validate
 from src.losses import build_loss
@@ -28,7 +27,7 @@ from src.utils.visualize import export_training_visualizations
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a patch baseline or attention-based MIL model.")
+    parser = argparse.ArgumentParser(description="Train a patch classification model.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     return parser.parse_args()
 
@@ -54,14 +53,6 @@ def resolve_path(path_value: str | Path | None) -> Path | None:
     if path.is_absolute():
         return path
     return PROJECT_ROOT / path
-
-
-def get_task_mode(config: dict[str, Any]) -> str:
-    task_config = config.get("task", {})
-    mode = str(task_config.get("mode", "patch")).lower() if isinstance(task_config, dict) else "patch"
-    if mode not in {"patch", "mil"}:
-        raise ValueError(f"Unsupported task.mode: {mode}. Expected one of ['patch', 'mil']")
-    return mode
 
 
 def build_run_dir(config: dict[str, Any]) -> Path:
@@ -134,58 +125,10 @@ def build_scheduler(
 
 def compute_class_counts(
     train_csv: Path,
-    task_mode: str,
     num_classes: int | None = None,
     label_names: list[str] | None = None,
 ) -> list[int]:
     dataframe = pd.read_csv(train_csv)
-    if task_mode == "mil":
-        if "source_image" not in dataframe.columns:
-            raise ValueError(f"MIL mode requires source_image in split CSV: {train_csv}")
-
-        dataframe["source_image"] = dataframe["source_image"].fillna("").astype(str).str.strip()
-        if (dataframe["source_image"].str.len() == 0).any():
-            raise ValueError(f"MIL mode requires non-empty source_image values in {train_csv}")
-
-        if "label_idx" in dataframe.columns:
-            bag_label_indices: list[int] = []
-            for source_image, group_df in dataframe.groupby("source_image", sort=True):
-                label_values = sorted(group_df["label_idx"].astype(int).unique().tolist())
-                if len(label_values) != 1:
-                    raise ValueError(
-                        f"MIL class count computation requires one label_idx per source_image. "
-                        f"source_image={source_image!r}, label_idx={label_values}"
-                    )
-                bag_label_indices.append(int(label_values[0]))
-
-            counts = Counter(bag_label_indices)
-            total_classes = int(num_classes) if num_classes is not None else (max(counts.keys()) + 1 if counts else 0)
-            return [int(counts.get(index, 0)) for index in range(total_classes)]
-
-        dataframe["label"] = dataframe["label"].astype(str)
-        bag_labels: list[str] = []
-        for source_image, group_df in dataframe.groupby("source_image", sort=True):
-            labels = sorted(group_df["label"].unique().tolist())
-            if len(labels) != 1:
-                raise ValueError(
-                    f"MIL class count computation requires one label per source_image. "
-                    f"source_image={source_image!r}, labels={labels}"
-                )
-            bag_labels.append(labels[0])
-
-        if label_names is not None:
-            counts = Counter(bag_labels)
-            unknown_labels = sorted(set(counts).difference(label_names))
-            if unknown_labels:
-                raise ValueError(
-                    f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}"
-                )
-            return [int(counts.get(label_name, 0)) for label_name in label_names]
-
-        counts = Counter(bag_labels)
-        labels = sorted(counts)
-        return [int(counts.get(label, 0)) for label in labels]
-
     if "label_idx" in dataframe.columns:
         label_counts = Counter(dataframe["label_idx"].astype(int).tolist())
         total_classes = int(num_classes) if num_classes is not None else (max(label_counts.keys()) + 1 if label_counts else 0)
@@ -262,29 +205,10 @@ def _append_validation_metrics(epoch_record: dict[str, Any], val_metrics: dict[s
 
 def _build_train_and_val_loaders(
     config: dict[str, Any],
-    task_mode: str,
     train_csv: Path,
     val_csv: Path,
     label_mapping_path: Path | None,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    if task_mode == "mil":
-        train_loader = build_mil_dataloader(
-            csv_file=train_csv,
-            mode="train",
-            config=config,
-            label_mapping_path=label_mapping_path,
-            project_root=PROJECT_ROOT,
-        )
-        val_loader = build_mil_dataloader(
-            csv_file=val_csv,
-            mode="val",
-            config=config,
-            label_mapping_path=label_mapping_path,
-            project_root=PROJECT_ROOT,
-            shuffle=False,
-        )
-        return train_loader, val_loader
-
     train_loader = build_dataloader(
         csv_file=train_csv,
         mode="train",
@@ -303,38 +227,6 @@ def _build_train_and_val_loaders(
     return train_loader, val_loader
 
 
-def _log_mil_dataset_statistics(
-    train_loader: torch.utils.data.DataLoader,
-    val_loader: torch.utils.data.DataLoader,
-    config: dict[str, Any],
-) -> None:
-    mil_config = config.get("mil", {})
-    aggregate_logits = str(mil_config.get("aggregate_logits", "mean")).lower()
-    logging.info(
-        "MIL mode enabled | bag_size=%s drop_last_incomplete_bag=%s shuffle_instances_within_image=%s aggregate_logits=%s",
-        mil_config.get("bag_size", 512),
-        mil_config.get("drop_last_incomplete_bag", False),
-        mil_config.get("shuffle_instances_within_image", True),
-        aggregate_logits,
-    )
-
-    for split_name, loader in (("Train", train_loader), ("Val", val_loader)):
-        stats_fn = getattr(loader.dataset, "get_statistics", None)
-        if not callable(stats_fn):
-            continue
-        stats = stats_fn()
-        logging.info(
-            "%s bags=%s source_images=%s avg_bags_per_image=%.2f avg_instances_per_bag=%.2f min_instances=%s max_instances=%s",
-            split_name,
-            stats["num_bags"],
-            stats["num_source_images"],
-            stats["avg_bags_per_image"],
-            stats["avg_instances_per_bag"],
-            stats["min_instances_per_bag"],
-            stats["max_instances_per_bag"],
-        )
-
-
 def run_training(config: dict[str, Any]) -> Path:
     seed = int(config.get("train", {}).get("seed", 42))
     seed_everything(seed)
@@ -343,11 +235,9 @@ def run_training(config: dict[str, Any]) -> Path:
     setup_logging(run_dir / "train.log")
     save_config_snapshot(config, run_dir)
 
-    task_mode = get_task_mode(config)
     device = select_device(config)
     use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
     logging.info("Run directory: %s", run_dir)
-    logging.info("Task mode: %s", task_mode)
     logging.info("Device: %s", device)
     logging.info("AMP enabled: %s", use_amp)
 
@@ -360,7 +250,6 @@ def run_training(config: dict[str, Any]) -> Path:
 
     train_loader, val_loader = _build_train_and_val_loaders(
         config=config,
-        task_mode=task_mode,
         train_csv=train_csv,
         val_csv=val_csv,
         label_mapping_path=label_mapping_path,
@@ -369,29 +258,18 @@ def run_training(config: dict[str, Any]) -> Path:
     model = build_model(config).to(device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
-    class_counts = compute_class_counts(train_csv, task_mode=task_mode, num_classes=num_classes, label_names=label_names)
+    class_counts = compute_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
     criterion = build_loss(config, class_counts=class_counts, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
-    if task_mode == "mil":
-        logging.info("Train bags: %s | Val bags: %s", len(train_loader.dataset), len(val_loader.dataset))
-        _log_mil_dataset_statistics(train_loader=train_loader, val_loader=val_loader, config=config)
-        logging.info(
-            "MIL model config: embedding_dim=%s attention_hidden_dim=%s dropout=%s return_attention=%s",
-            config.get("mil", {}).get("embedding_dim", 256),
-            config.get("mil", {}).get("attention_hidden_dim", 128),
-            config.get("mil", {}).get("dropout", config.get("model", {}).get("dropout", 0.0)),
-            config.get("mil", {}).get("return_attention", False),
-        )
-    else:
-        logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
-        logging.info(
-            "Evaluation: level=%s aggregation=%s",
-            config.get("evaluation", {}).get("level", "both"),
-            config.get("evaluation", {}).get("aggregation", "mean_prob"),
-        )
+    logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
+    logging.info(
+        "Evaluation: level=%s aggregation=%s",
+        config.get("evaluation", {}).get("level", "both"),
+        config.get("evaluation", {}).get("aggregation", "mean_prob"),
+    )
 
     num_epochs = int(config.get("train", {}).get("epochs", 20))
     history: list[dict[str, float | int | str | None]] = []
@@ -407,8 +285,6 @@ def run_training(config: dict[str, Any]) -> Path:
             epoch=epoch,
             scaler=scaler,
             use_amp=use_amp,
-            task_mode=task_mode,
-            config=config,
         )
         val_metrics = validate(
             model=model,
@@ -502,7 +378,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-

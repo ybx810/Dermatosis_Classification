@@ -14,7 +14,7 @@ from src.utils.io import load_yaml
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a trained patch or MIL checkpoint on the test split.")
+    parser = argparse.ArgumentParser(description="Evaluate a trained patch classification checkpoint on the test split.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--run-dir", type=str, default=None)

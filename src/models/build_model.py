@@ -5,24 +5,10 @@ from typing import Any
 import torch.nn as nn
 from torchvision import models
 
-from src.models.mil_model import AttentionMILModel
-
 SUPPORTED_BACKBONES = ("resnet18", "resnet50", "efficientnet_b0", "convnext_tiny")
 
 
-def _get_task_mode(config: dict[str, Any]) -> str:
-    task_config = config.get("task", {})
-    if isinstance(task_config, dict):
-        mode = str(task_config.get("mode", "patch")).lower()
-    else:
-        mode = "patch"
-
-    if mode not in {"patch", "mil"}:
-        raise ValueError(f"Unsupported task.mode: {mode}. Expected one of ['patch', 'mil']")
-    return mode
-
-
-def _get_patch_model_config(config: dict[str, Any]) -> tuple[str, bool, int, float]:
+def _get_model_config(config: dict[str, Any]) -> tuple[str, bool, int, float]:
     model_config = config.get("model", {})
     data_config = config.get("data", {})
 
@@ -101,8 +87,10 @@ def _build_convnext_tiny(num_classes: int, pretrained: bool, dropout: float) -> 
     return model
 
 
-def _build_patch_model(config: dict[str, Any]) -> nn.Module:
-    model_name, pretrained, num_classes, dropout = _get_patch_model_config(config)
+def build_model(config: dict[str, Any]) -> nn.Module:
+    """Build a torchvision patch classification model."""
+
+    model_name, pretrained, num_classes, dropout = _get_model_config(config)
 
     if model_name == "resnet18":
         return _build_resnet18(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
@@ -117,47 +105,3 @@ def _build_patch_model(config: dict[str, Any]) -> nn.Module:
         f"Unsupported model backbone: {model_name}. "
         f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
     )
-
-
-def _build_mil_model(config: dict[str, Any]) -> nn.Module:
-    model_config = config.get("model", {})
-    data_config = config.get("data", {})
-    mil_config = config.get("mil", {})
-
-    backbone_name = str(model_config.get("name", "resnet18")).lower()
-    pretrained = bool(model_config.get("pretrained", True))
-    num_classes = int(data_config.get("num_classes", model_config.get("num_classes", 2)))
-    if not bool(mil_config.get("enabled", True)):
-        raise ValueError("task.mode is set to 'mil' but mil.enabled is false.")
-    embedding_dim = int(mil_config.get("embedding_dim", 256))
-    attention_hidden_dim = int(mil_config.get("attention_hidden_dim", 128))
-    dropout = float(mil_config.get("dropout", model_config.get("dropout", 0.0)))
-    return_attention = bool(mil_config.get("return_attention", False))
-
-    if backbone_name not in SUPPORTED_BACKBONES:
-        raise ValueError(
-            f"Unsupported MIL backbone: {backbone_name}. "
-            f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
-        )
-    if not 0.0 <= dropout <= 1.0:
-        raise ValueError(f"mil.dropout must be in [0.0, 1.0], got: {dropout}")
-
-    return AttentionMILModel(
-        backbone_name=backbone_name,
-        pretrained=pretrained,
-        num_classes=num_classes,
-        embedding_dim=embedding_dim,
-        attention_hidden_dim=attention_hidden_dim,
-        dropout=dropout,
-        return_attention=return_attention,
-    )
-
-
-def build_model(config: dict[str, Any]) -> nn.Module:
-    """Build either the patch baseline model or the attention-based MIL model."""
-
-    task_mode = _get_task_mode(config)
-    if task_mode == "mil":
-        return _build_mil_model(config)
-    return _build_patch_model(config)
-

@@ -3,9 +3,6 @@
   task: patch-classification
   output_dir: outputs
 
-task:
-  mode: mil
-
 data:
   raw_dir: data/raw/16disease_full
   patch_dir: data/patches
@@ -45,24 +42,10 @@ build_patch_splits:
   group_by: auto
 
 evaluation:
-  level: image
+  level: both
   aggregation: mean_prob
   report_patch_metrics: true
   report_image_metrics: true
-
-mil:
-  enabled: true
-  bag_size: 512
-  drop_last_incomplete_bag: false
-  shuffle_instances_within_image: true
-  aggregate_logits: mean
-  max_instances_per_bag:
-  min_instances_per_bag: 1
-  sample_strategy: none
-  embedding_dim: 256
-  attention_hidden_dim: 128
-  dropout: 0.3
-  return_attention: true
 
 train:
   batch_size: 16
