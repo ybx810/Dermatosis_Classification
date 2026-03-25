@@ -66,6 +66,12 @@ augmentation:
   horizontal_flip: 0.5
   vertical_flip: 0.5
   normalize: imagenet
+  noise:
+    enabled: true
+    type: gaussian
+    p: 0.2
+    std_min: 5.0
+    std_max: 15.0
 
 model:
   name: resnet18
