@@ -10,10 +10,11 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from src.datasets.skin_patch_dataset import build_dataloader
+from src.datasets import build_dataloader, build_dual_branch_dataloader
 from src.losses import build_loss
 from src.models import build_model
 from src.utils.metrics import (
+    build_single_level_evaluation_result,
     compute_multilevel_classification_metrics,
     save_confusion_matrix_figure,
     save_metrics_json,
@@ -36,7 +37,14 @@ def _select_device(config: dict[str, Any]) -> torch.device:
     return torch.device("cpu")
 
 
-def _compute_class_counts(
+def _get_task_mode(config: dict[str, Any]) -> str:
+    task_mode = str(config.get("task", {}).get("mode", "patch")).lower()
+    if task_mode not in {"patch", "dual_branch"}:
+        raise ValueError(f"Unsupported task.mode: {task_mode}")
+    return task_mode
+
+
+def _compute_patch_class_counts(
     train_csv: Path,
     num_classes: int | None = None,
     label_names: list[str] | None = None,
@@ -57,6 +65,41 @@ def _compute_class_counts(
 
     labels = sorted(counts)
     return [int(counts.get(label, 0)) for label in labels]
+
+
+def _compute_image_class_counts(
+    train_csv: Path,
+    num_classes: int | None = None,
+    label_names: list[str] | None = None,
+) -> list[int]:
+    dataframe = pd.read_csv(train_csv)
+    if "source_image" not in dataframe.columns:
+        raise ValueError("dual_branch mode requires source_image in the split CSV to compute image-level class counts.")
+
+    grouped_counts: Counter[str] = Counter()
+    for source_image, group in dataframe.groupby("source_image", sort=False):
+        labels = sorted(group["label"].astype(str).unique().tolist())
+        if len(labels) != 1:
+            raise ValueError(
+                "dual_branch mode expects a single image-level label per source_image, but found "
+                f"multiple labels for '{source_image}': {labels}"
+            )
+        grouped_counts[labels[0]] += 1
+
+    if label_names is not None:
+        unknown_labels = sorted(set(grouped_counts).difference(label_names))
+        if unknown_labels:
+            raise ValueError(f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}")
+        return [int(grouped_counts.get(label_name, 0)) for label_name in label_names]
+
+    if num_classes is not None:
+        labels = sorted(grouped_counts)
+        if len(labels) > num_classes:
+            raise ValueError(f"Found {len(labels)} labels in {train_csv}, which exceeds num_classes={num_classes}.")
+        return [int(grouped_counts.get(label, 0)) for label in labels]
+
+    labels = sorted(grouped_counts)
+    return [int(grouped_counts.get(label, 0)) for label in labels]
 
 
 def _load_label_names(label_mapping_path: Path | None, num_classes: int | None = None) -> list[str] | None:
@@ -88,6 +131,13 @@ def _save_level_artifacts(metrics: dict[str, Any], output_dir: Path, prefix: str
     logging.info("Saved %s confusion matrix to %s", prefix, confusion_path)
 
 
+def _move_patch_images_to_device(
+    patch_images: list[torch.Tensor],
+    device: torch.device,
+) -> list[torch.Tensor]:
+    return [patch_tensor.to(device, non_blocking=True) for patch_tensor in patch_images]
+
+
 @torch.no_grad()
 def test_model(
     model: torch.nn.Module,
@@ -98,8 +148,13 @@ def test_model(
     label_names: list[str] | None = None,
     use_amp: bool = False,
     evaluation_config: dict[str, Any] | None = None,
+    task_mode: str = "patch",
 ) -> dict[str, Any]:
     """Run evaluation on the test set and save metrics/artifacts."""
+
+    task_mode = str(task_mode).lower()
+    if task_mode not in {"patch", "dual_branch"}:
+        raise ValueError(f"Unsupported task_mode: {task_mode}")
 
     model.eval()
     output_dir = Path(output_dir)
@@ -114,18 +169,25 @@ def test_model(
 
     progress = tqdm(dataloader, desc="Test", leave=False)
     for batch in progress:
-        images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(images)
-            loss = criterion(logits, labels)
-
-        batch_size = images.size(0)
-        if "source_image" in batch:
-            source_images.extend([str(value) for value in batch["source_image"]])
-        if "patch_path" in batch:
-            patch_paths.extend([str(value) for value in batch["patch_path"]])
+        if task_mode == "dual_branch":
+            whole_images = batch["whole_image"].to(device, non_blocking=True)
+            patch_images = _move_patch_images_to_device(batch["patch_images"], device)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(whole_images, patch_images)
+                loss = criterion(logits, labels)
+            batch_size = whole_images.size(0)
+        else:
+            images = batch["image"].to(device, non_blocking=True)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(images)
+                loss = criterion(logits, labels)
+            batch_size = images.size(0)
+            if "source_image" in batch:
+                source_images.extend([str(value) for value in batch["source_image"]])
+            if "patch_path" in batch:
+                patch_paths.extend([str(value) for value in batch["patch_path"]])
 
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(probs, dim=1)
@@ -137,16 +199,27 @@ def test_model(
         progress.set_postfix(loss=f"{loss.detach().item():.4f}")
 
     test_loss = running_loss / max(1, len(dataloader.dataset))
-    metrics = compute_multilevel_classification_metrics(
-        targets=targets,
-        predictions=predictions,
-        probabilities=probabilities,
-        label_names=label_names,
-        source_images=source_images if source_images else None,
-        patch_paths=patch_paths if patch_paths else None,
-        loss=float(test_loss),
-        evaluation_config=evaluation_config,
-    )
+    if task_mode == "dual_branch":
+        metrics = build_single_level_evaluation_result(
+            targets=targets,
+            predictions=predictions,
+            probabilities=probabilities,
+            label_names=label_names,
+            loss=float(test_loss),
+            sample_level="image",
+            aggregation="model_direct",
+        )
+    else:
+        metrics = compute_multilevel_classification_metrics(
+            targets=targets,
+            predictions=predictions,
+            probabilities=probabilities,
+            label_names=label_names,
+            source_images=source_images if source_images else None,
+            patch_paths=patch_paths if patch_paths else None,
+            loss=float(test_loss),
+            evaluation_config=evaluation_config,
+        )
 
     metrics_path = save_metrics_json(metrics, output_dir / "metrics.json")
     logging.info("Saved combined test metrics to %s", metrics_path)
@@ -187,6 +260,7 @@ def run_test_from_checkpoint(
     run_dir = Path(run_dir)
     device = _select_device(config)
     use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
+    task_mode = _get_task_mode(config)
 
     split_dir = _resolve_path(project_root, config.get("build_patch_splits", {}).get("output_dir", "data/splits"))
     label_mapping_path = _resolve_path(
@@ -196,29 +270,51 @@ def run_test_from_checkpoint(
 
     train_csv = split_dir / "train.csv"
     test_csv = split_dir / "test.csv"
-    test_loader = build_dataloader(
-        csv_file=test_csv,
-        mode="test",
-        config=config,
-        label_mapping_path=label_mapping_path,
-        project_root=project_root,
-        shuffle=False,
-    )
+    if task_mode == "dual_branch":
+        test_loader = build_dual_branch_dataloader(
+            csv_file=test_csv,
+            mode="test",
+            config=config,
+            label_mapping_path=label_mapping_path,
+            project_root=project_root,
+            shuffle=False,
+        )
+    else:
+        test_loader = build_dataloader(
+            csv_file=test_csv,
+            mode="test",
+            config=config,
+            label_mapping_path=label_mapping_path,
+            project_root=project_root,
+            shuffle=False,
+        )
 
     model = build_model(config).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     label_names = _load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
-    class_counts = _compute_class_counts(
-        train_csv,
-        num_classes=config.get("data", {}).get("num_classes"),
-        label_names=label_names,
-    )
+    if task_mode == "dual_branch":
+        class_counts = _compute_image_class_counts(
+            train_csv,
+            num_classes=config.get("data", {}).get("num_classes"),
+            label_names=label_names,
+        )
+    else:
+        class_counts = _compute_patch_class_counts(
+            train_csv,
+            num_classes=config.get("data", {}).get("num_classes"),
+            label_names=label_names,
+        )
     criterion = build_loss(config, class_counts=class_counts, device=device)
 
     logging.info("Testing checkpoint: %s", checkpoint_path)
-    logging.info("Test samples: %s", len(test_loader.dataset))
+    if task_mode == "dual_branch":
+        logging.info("Task mode: dual_branch")
+        logging.info("Test images: %s", len(test_loader.dataset))
+    else:
+        logging.info("Task mode: patch")
+        logging.info("Test samples: %s", len(test_loader.dataset))
 
     return test_model(
         model=model,
@@ -229,4 +325,5 @@ def run_test_from_checkpoint(
         label_names=label_names,
         use_amp=use_amp,
         evaluation_config=config,
+        task_mode=task_mode,
     )

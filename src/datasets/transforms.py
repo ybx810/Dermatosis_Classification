@@ -60,3 +60,35 @@ def build_patch_transforms(mode: str, transform_cfg: dict[str, Any] | None = Non
         ]
     )
     return A.Compose(transforms)
+
+
+def build_whole_image_transforms(
+    mode: str,
+    transform_cfg: dict[str, Any] | None = None,
+    whole_image_size: int | None = None,
+) -> A.Compose:
+    transform_cfg = transform_cfg or {}
+    mode = mode.lower()
+    if mode not in {"train", "val", "test"}:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    horizontal_flip = float(transform_cfg.get("horizontal_flip", 0.0))
+    vertical_flip = float(transform_cfg.get("vertical_flip", 0.0))
+    normalize_cfg = transform_cfg.get("normalize", "imagenet")
+    mean, std = _get_normalize_stats(normalize_cfg)
+    resolved_size = int(whole_image_size or transform_cfg.get("crop_size") or transform_cfg.get("resize_height") or 512)
+
+    transforms: list[A.BasicTransform] = [A.Resize(height=resolved_size, width=resolved_size)]
+    if mode == "train":
+        if horizontal_flip > 0:
+            transforms.append(A.HorizontalFlip(p=horizontal_flip))
+        if vertical_flip > 0:
+            transforms.append(A.VerticalFlip(p=vertical_flip))
+
+    transforms.extend(
+        [
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ]
+    )
+    return A.Compose(transforms)

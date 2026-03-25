@@ -3,6 +3,9 @@
   task: patch-classification
   output_dir: outputs
 
+task:
+  mode: patch
+
 data:
   raw_dir: data/raw/16disease_full
   patch_dir: data/patches
@@ -70,6 +73,20 @@ augmentation:
 model:
   name: resnet18
   pretrained: true
+  dropout: 0.3
+
+dual_branch:
+  batch_size: 2
+  whole_backbone: resnet18
+  patch_backbone: resnet18
+  whole_image_size: 512
+  patch_pooling: mean
+  max_patches_per_image: 64
+  patch_sample_strategy: random
+  fusion: concat
+  embedding_dim: 256
+  fusion_hidden_dim: 256
+  attention_heads: 4
   dropout: 0.3
 
 loss:

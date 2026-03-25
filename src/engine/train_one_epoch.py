@@ -19,6 +19,13 @@ def _compute_epoch_metrics(predictions: list[int], targets: list[int]) -> dict[s
     }
 
 
+def _move_patch_images_to_device(
+    patch_images: list[torch.Tensor],
+    device: torch.device,
+) -> list[torch.Tensor]:
+    return [patch_tensor.to(device, non_blocking=True) for patch_tensor in patch_images]
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -28,8 +35,15 @@ def train_one_epoch(
     epoch: int,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
+    task_mode: str = "patch",
 ) -> dict[str, float]:
+    task_mode = str(task_mode).lower()
+    if task_mode not in {"patch", "dual_branch"}:
+        raise ValueError(f"Unsupported task_mode: {task_mode}")
+
     model.train()
+    if task_mode == "dual_branch" and hasattr(dataloader.dataset, "set_epoch"):
+        dataloader.dataset.set_epoch(epoch)
 
     running_loss = 0.0
     predictions: list[int] = []
@@ -38,15 +52,22 @@ def train_one_epoch(
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}", leave=False)
     for batch in progress:
         optimizer.zero_grad(set_to_none=True)
-
-        images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(images)
-            loss = criterion(logits, labels)
+        if task_mode == "dual_branch":
+            whole_images = batch["whole_image"].to(device, non_blocking=True)
+            patch_images = _move_patch_images_to_device(batch["patch_images"], device)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(whole_images, patch_images)
+                loss = criterion(logits, labels)
+            batch_size = whole_images.size(0)
+        else:
+            images = batch["image"].to(device, non_blocking=True)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(images)
+                loss = criterion(logits, labels)
+            batch_size = images.size(0)
 
-        batch_size = images.size(0)
         batch_predictions = torch.argmax(logits.detach(), dim=1)
         predictions.extend(batch_predictions.cpu().tolist())
         targets.extend(labels.detach().cpu().tolist())

@@ -5,10 +5,21 @@ from typing import Any
 import torch.nn as nn
 from torchvision import models
 
+from src.models.dual_branch_model import DualBranchImagePatchClassifier
+
 SUPPORTED_BACKBONES = ("resnet18", "resnet50", "efficientnet_b0", "convnext_tiny")
+SUPPORTED_TASK_MODES = {"patch", "dual_branch"}
 
 
-def _get_model_config(config: dict[str, Any]) -> tuple[str, bool, int, float]:
+def _get_task_mode(config: dict[str, Any]) -> str:
+    task_config = config.get("task", {})
+    task_mode = str(task_config.get("mode", "patch")).lower()
+    if task_mode not in SUPPORTED_TASK_MODES:
+        raise ValueError(f"Unsupported task.mode: {task_mode}. Expected one of {sorted(SUPPORTED_TASK_MODES)}")
+    return task_mode
+
+
+def _get_patch_model_config(config: dict[str, Any]) -> tuple[str, bool, int, float]:
     model_config = config.get("model", {})
     data_config = config.get("data", {})
 
@@ -49,21 +60,21 @@ def _replace_classifier_with_configurable_dropout(
     return nn.Sequential(*preserved_layers)
 
 
-def _build_resnet18(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
+def _build_patch_resnet18(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
     weights = models.ResNet18_Weights.DEFAULT if pretrained else None
     model = models.resnet18(weights=weights)
     model.fc = _build_dropout_linear(model.fc.in_features, num_classes, dropout)
     return model
 
 
-def _build_resnet50(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
+def _build_patch_resnet50(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
     weights = models.ResNet50_Weights.DEFAULT if pretrained else None
     model = models.resnet50(weights=weights)
     model.fc = _build_dropout_linear(model.fc.in_features, num_classes, dropout)
     return model
 
 
-def _build_efficientnet_b0(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
+def _build_patch_efficientnet_b0(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
     weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
     model = models.efficientnet_b0(weights=weights)
     model.classifier = _replace_classifier_with_configurable_dropout(
@@ -75,7 +86,7 @@ def _build_efficientnet_b0(num_classes: int, pretrained: bool, dropout: float) -
     return model
 
 
-def _build_convnext_tiny(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
+def _build_patch_convnext_tiny(num_classes: int, pretrained: bool, dropout: float) -> nn.Module:
     weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
     model = models.convnext_tiny(weights=weights)
     model.classifier = _replace_classifier_with_configurable_dropout(
@@ -87,21 +98,57 @@ def _build_convnext_tiny(num_classes: int, pretrained: bool, dropout: float) -> 
     return model
 
 
-def build_model(config: dict[str, Any]) -> nn.Module:
-    """Build a torchvision patch classification model."""
-
-    model_name, pretrained, num_classes, dropout = _get_model_config(config)
+def _build_patch_model(config: dict[str, Any]) -> nn.Module:
+    model_name, pretrained, num_classes, dropout = _get_patch_model_config(config)
 
     if model_name == "resnet18":
-        return _build_resnet18(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
+        return _build_patch_resnet18(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
     if model_name == "resnet50":
-        return _build_resnet50(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
+        return _build_patch_resnet50(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
     if model_name == "efficientnet_b0":
-        return _build_efficientnet_b0(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
+        return _build_patch_efficientnet_b0(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
     if model_name == "convnext_tiny":
-        return _build_convnext_tiny(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
+        return _build_patch_convnext_tiny(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
 
     raise ValueError(
         f"Unsupported model backbone: {model_name}. "
         f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
     )
+
+
+def _build_dual_branch_model(config: dict[str, Any]) -> nn.Module:
+    model_name, pretrained, num_classes, model_dropout = _get_patch_model_config(config)
+    dual_branch_config = config.get("dual_branch", {})
+
+    whole_backbone = str(dual_branch_config.get("whole_backbone", model_name)).lower()
+    patch_backbone = str(dual_branch_config.get("patch_backbone", model_name)).lower()
+    embedding_dim = int(dual_branch_config.get("embedding_dim", 256))
+    fusion_hidden_dim = int(dual_branch_config.get("fusion_hidden_dim", embedding_dim))
+    dropout = float(dual_branch_config.get("dropout", model_dropout))
+    patch_pooling = str(dual_branch_config.get("patch_pooling", "mean")).lower()
+    fusion = str(dual_branch_config.get("fusion", "concat")).lower()
+    attention_heads = int(dual_branch_config.get("attention_heads", 4))
+
+    return DualBranchImagePatchClassifier(
+        whole_backbone=whole_backbone,
+        patch_backbone=patch_backbone,
+        num_classes=num_classes,
+        pretrained=pretrained,
+        patch_pooling=patch_pooling,
+        fusion=fusion,
+        embedding_dim=embedding_dim,
+        fusion_hidden_dim=fusion_hidden_dim,
+        dropout=dropout,
+        attention_heads=attention_heads,
+    )
+
+
+def build_model(config: dict[str, Any]) -> nn.Module:
+    """Build either the patch baseline model or the dual-branch image-level model."""
+
+    task_mode = _get_task_mode(config)
+    if task_mode == "patch":
+        return _build_patch_model(config)
+    if task_mode == "dual_branch":
+        return _build_dual_branch_model(config)
+    raise RuntimeError(f"Unsupported task mode: {task_mode}")

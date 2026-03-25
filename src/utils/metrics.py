@@ -449,3 +449,53 @@ def save_metrics_json(metrics: dict[str, Any], output_path: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     return output_path
+
+
+def build_single_level_evaluation_result(
+    targets: list[int] | np.ndarray,
+    predictions: list[int] | np.ndarray,
+    probabilities: list[list[float]] | np.ndarray | None = None,
+    label_names: list[str] | None = None,
+    loss: float | None = None,
+    sample_level: str = "image",
+    aggregation: str = "model_direct",
+) -> dict[str, Any]:
+    level_name = str(sample_level).lower()
+    if level_name not in {"patch", "image"}:
+        raise ValueError(f"Unsupported sample_level: {sample_level}. Expected 'patch' or 'image'.")
+
+    metrics = compute_classification_metrics(
+        targets=targets,
+        predictions=predictions,
+        probabilities=probabilities,
+        label_names=label_names,
+    )
+    metrics["loss"] = float(loss) if loss is not None else None
+    metrics["num_samples"] = int(len(targets))
+    metrics["sample_level"] = level_name
+    metrics["aggregation"] = aggregation
+
+    results: dict[str, Any] = {
+        "loss": float(loss) if loss is not None else metrics.get("loss"),
+        "num_samples": int(len(targets)),
+        "evaluation_level": level_name,
+        "aggregation": aggregation,
+        "primary_metric_level": level_name,
+        "accuracy": float(metrics["accuracy"]),
+        "precision": float(metrics["precision"]),
+        "recall": float(metrics["recall"]),
+        "macro_f1": float(metrics["macro_f1"]),
+        "auc_ovr": metrics.get("auc_ovr"),
+        "confusion_matrix": metrics["confusion_matrix"],
+        "labels": metrics["labels"],
+        f"{level_name}_metrics": metrics,
+        f"{level_name}_accuracy": float(metrics["accuracy"]),
+        f"{level_name}_precision": float(metrics["precision"]),
+        f"{level_name}_recall": float(metrics["recall"]),
+        f"{level_name}_macro_f1": float(metrics["macro_f1"]),
+        f"{level_name}_auc_ovr": metrics.get("auc_ovr"),
+        f"{level_name}_confusion_matrix": metrics["confusion_matrix"],
+    }
+    if level_name == "image":
+        results["num_images"] = int(metrics["num_samples"])
+    return results
