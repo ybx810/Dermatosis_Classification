@@ -17,6 +17,8 @@ from src.utils.metrics import (
     compute_multilevel_classification_metrics,
     save_confusion_matrix_figure,
     save_metrics_json,
+    save_per_class_metrics_csv,
+    save_per_class_metrics_json,
 )
 
 
@@ -84,8 +86,19 @@ def _save_level_artifacts(metrics: dict[str, Any], output_dir: Path, prefix: str
         label_names=metrics["labels"],
         output_path=output_dir / f"{prefix}_confusion_matrix.png",
     )
+    per_class_metrics = list(metrics.get("per_class_metrics", []))
+    per_class_json_path = save_per_class_metrics_json(
+        per_class_metrics,
+        output_dir / f"{prefix}_per_class_metrics.json",
+    )
+    per_class_csv_path = save_per_class_metrics_csv(
+        per_class_metrics,
+        output_dir / f"{prefix}_per_class_metrics.csv",
+    )
     logging.info("Saved %s metrics to %s", prefix, metrics_path)
     logging.info("Saved %s confusion matrix to %s", prefix, confusion_path)
+    logging.info("Saved %s per-class metrics json to %s", prefix, per_class_json_path)
+    logging.info("Saved %s per-class metrics csv to %s", prefix, per_class_csv_path)
 
 
 @torch.no_grad()

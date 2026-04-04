@@ -43,13 +43,13 @@ build_patch_splits:
 
 evaluation:
   level: both
-  aggregation: mean_prob
+  aggregation: max_prob
   report_patch_metrics: true
   report_image_metrics: true
 
 train:
   batch_size: 16
-  num_workers: 4
+  num_workers: 8
   epochs: 10
   device: cuda
   mixed_precision: true
@@ -68,7 +68,7 @@ augmentation:
   normalize: imagenet
 
 model:
-  name: resnet18
+  name: efficientnet_b0
   pretrained: true
   dropout: 0.3
 

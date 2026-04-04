@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import csv
 import json
 from collections import Counter
 from pathlib import Path
@@ -13,6 +14,7 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     precision_score,
+    precision_recall_fscore_support,
     recall_score,
     roc_auc_score,
 )
@@ -28,6 +30,39 @@ VALID_EVALUATION_LEVELS = {"patch", "image", "both"}
 VALID_AGGREGATIONS = {"mean_prob", "majority_vote", "max_prob"}
 
 
+def _build_per_class_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    labels: list[int],
+    label_names: list[str],
+) -> list[dict[str, Any]]:
+    if not labels:
+        return []
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=labels,
+        average=None,
+        zero_division=0,
+    )
+
+    per_class_metrics: list[dict[str, Any]] = []
+    for index, class_index in enumerate(labels):
+        class_name = label_names[index] if index < len(label_names) else str(class_index)
+        per_class_metrics.append(
+            {
+                "class_index": int(class_index),
+                "class_name": str(class_name),
+                "precision": float(precision[index]),
+                "recall": float(recall[index]),
+                "f1": float(f1[index]),
+                "support": int(support[index]),
+            }
+        )
+    return per_class_metrics
+
+
 def compute_classification_metrics(
     targets: list[int] | np.ndarray,
     predictions: list[int] | np.ndarray,
@@ -41,6 +76,7 @@ def compute_classification_metrics(
     y_prob = None if probabilities is None else np.asarray(probabilities, dtype=np.float64)
 
     if y_true.size == 0:
+        empty_label_names = list(label_names or [])
         return {
             "accuracy": 0.0,
             "precision": 0.0,
@@ -48,7 +84,18 @@ def compute_classification_metrics(
             "macro_f1": 0.0,
             "auc_ovr": None,
             "confusion_matrix": [],
-            "labels": label_names or [],
+            "labels": empty_label_names,
+            "per_class_metrics": [
+                {
+                    "class_index": int(index),
+                    "class_name": str(class_name),
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "f1": 0.0,
+                    "support": 0,
+                }
+                for index, class_name in enumerate(empty_label_names)
+            ],
         }
 
     inferred_num_classes = None
@@ -79,6 +126,12 @@ def compute_classification_metrics(
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
         "labels": label_names,
         "auc_ovr": None,
+        "per_class_metrics": _build_per_class_metrics(
+            y_true=y_true,
+            y_pred=y_pred,
+            labels=labels,
+            label_names=label_names,
+        ),
     }
 
     if y_prob is not None:
@@ -448,4 +501,32 @@ def save_metrics_json(metrics: dict[str, Any], output_path: str | Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_path
+
+
+def save_per_class_metrics_json(per_class_metrics: list[dict[str, Any]], output_path: str | Path) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(per_class_metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_path
+
+
+def save_per_class_metrics_csv(per_class_metrics: list[dict[str, Any]], output_path: str | Path) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["class_index", "class_name", "precision", "recall", "f1", "support"]
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in per_class_metrics:
+            writer.writerow(
+                {
+                    "class_index": int(row.get("class_index", 0)),
+                    "class_name": str(row.get("class_name", "")),
+                    "precision": float(row.get("precision", 0.0)),
+                    "recall": float(row.get("recall", 0.0)),
+                    "f1": float(row.get("f1", 0.0)),
+                    "support": int(row.get("support", 0)),
+                }
+            )
     return output_path
