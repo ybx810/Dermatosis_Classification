@@ -1,6 +1,6 @@
-﻿project:
+project:
   name: large-medical-image-patch-classification
-  task: patch-classification
+  task: patch-whole-image-classification
   output_dir: outputs
 
 task:
@@ -44,6 +44,14 @@ build_patch_splits:
   seed: 42
   group_by: auto
 
+whole_image:
+  image_size: 512
+  resize_size: 544
+  interpolation: bilinear
+  train_csv: data/splits/train_images.csv
+  val_csv: data/splits/val_images.csv
+  test_csv: data/splits/test_images.csv
+
 evaluation:
   level: both
   aggregation: mean_prob
@@ -73,20 +81,6 @@ augmentation:
 model:
   name: resnet18
   pretrained: true
-  dropout: 0.3
-
-dual_branch:
-  batch_size: 2
-  whole_backbone: resnet18
-  patch_backbone: resnet18
-  whole_image_size: 512
-  patch_pooling: mean
-  max_patches_per_image: 64
-  patch_sample_strategy: random
-  fusion: concat
-  embedding_dim: 256
-  fusion_hidden_dim: 256
-  attention_heads: 4
   dropout: 0.3
 
 loss:

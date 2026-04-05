@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.datasets import build_dataloader, build_dual_branch_dataloader
+from src.datasets import build_patch_dataloader, build_whole_image_dataloader
 from src.engine import train_one_epoch, validate
 from src.losses import build_loss
 from src.models import build_model
@@ -26,7 +26,7 @@ from src.utils.seed import seed_everything
 from src.utils.visualize import export_training_visualizations
 
 
-SUPPORTED_TASK_MODES = {"patch", "dual_branch"}
+SUPPORTED_TASK_MODES = {"patch", "whole_image"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,7 +133,7 @@ def _get_task_mode(config: dict[str, Any]) -> str:
     return task_mode
 
 
-def compute_patch_class_counts(
+def compute_class_counts(
     train_csv: Path,
     num_classes: int | None = None,
     label_names: list[str] | None = None,
@@ -154,41 +154,6 @@ def compute_patch_class_counts(
 
     labels = sorted(counts)
     return [int(counts.get(label, 0)) for label in labels]
-
-
-def compute_image_class_counts(
-    train_csv: Path,
-    num_classes: int | None = None,
-    label_names: list[str] | None = None,
-) -> list[int]:
-    dataframe = pd.read_csv(train_csv)
-    if "source_image" not in dataframe.columns:
-        raise ValueError("dual_branch mode requires source_image in the split CSV to compute image-level class counts.")
-
-    grouped_counts: Counter[str] = Counter()
-    for source_image, group in dataframe.groupby("source_image", sort=False):
-        labels = sorted(group["label"].astype(str).unique().tolist())
-        if len(labels) != 1:
-            raise ValueError(
-                "dual_branch mode expects a single image-level label per source_image, but found "
-                f"multiple labels for '{source_image}': {labels}"
-            )
-        grouped_counts[labels[0]] += 1
-
-    if label_names is not None:
-        unknown_labels = sorted(set(grouped_counts).difference(label_names))
-        if unknown_labels:
-            raise ValueError(f"Found labels in {train_csv} that are missing from label_names: {unknown_labels}")
-        return [int(grouped_counts.get(label_name, 0)) for label_name in label_names]
-
-    if num_classes is not None:
-        labels = sorted(grouped_counts)
-        if len(labels) > num_classes:
-            raise ValueError(f"Found {len(labels)} labels in {train_csv}, which exceeds num_classes={num_classes}.")
-        return [int(grouped_counts.get(label, 0)) for label in labels]
-
-    labels = sorted(grouped_counts)
-    return [int(grouped_counts.get(label, 0)) for label in labels]
 
 
 def load_label_names(label_mapping_path: Path | None, num_classes: int | None = None) -> list[str] | None:
@@ -248,6 +213,31 @@ def _append_validation_metrics(epoch_record: dict[str, Any], val_metrics: dict[s
         epoch_record["val_image_auc_ovr"] = val_metrics.get("image_auc_ovr")
 
 
+def _resolve_split_dir(config: dict[str, Any]) -> Path:
+    return resolve_path(
+        config.get("data", {}).get("split_dir") or config.get("build_patch_splits", {}).get("output_dir") or "data/splits"
+    )
+
+
+def _resolve_label_mapping_path(config: dict[str, Any], split_dir: Path) -> Path:
+    return resolve_path(config.get("build_patch_splits", {}).get("label_mapping_path") or split_dir / "label_mapping.json")
+
+
+def _resolve_split_csvs(config: dict[str, Any], task_mode: str) -> tuple[Path, Path, Path]:
+    split_dir = _resolve_split_dir(config)
+    label_mapping_path = _resolve_label_mapping_path(config, split_dir)
+
+    if task_mode == "whole_image":
+        whole_image_config = config.get("whole_image", {})
+        train_csv = resolve_path(whole_image_config.get("train_csv") or split_dir / "train_images.csv")
+        val_csv = resolve_path(whole_image_config.get("val_csv") or split_dir / "val_images.csv")
+        return train_csv, val_csv, label_mapping_path
+
+    train_csv = split_dir / "train.csv"
+    val_csv = split_dir / "val.csv"
+    return train_csv, val_csv, label_mapping_path
+
+
 def _build_train_and_val_loaders(
     config: dict[str, Any],
     train_csv: Path,
@@ -255,15 +245,15 @@ def _build_train_and_val_loaders(
     label_mapping_path: Path | None,
     task_mode: str,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    if task_mode == "dual_branch":
-        train_loader = build_dual_branch_dataloader(
+    if task_mode == "whole_image":
+        train_loader = build_whole_image_dataloader(
             csv_file=train_csv,
             mode="train",
             config=config,
             label_mapping_path=label_mapping_path,
             project_root=PROJECT_ROOT,
         )
-        val_loader = build_dual_branch_dataloader(
+        val_loader = build_whole_image_dataloader(
             csv_file=val_csv,
             mode="val",
             config=config,
@@ -273,14 +263,14 @@ def _build_train_and_val_loaders(
         )
         return train_loader, val_loader
 
-    train_loader = build_dataloader(
+    train_loader = build_patch_dataloader(
         csv_file=train_csv,
         mode="train",
         config=config,
         label_mapping_path=label_mapping_path,
         project_root=PROJECT_ROOT,
     )
-    val_loader = build_dataloader(
+    val_loader = build_patch_dataloader(
         csv_file=val_csv,
         mode="val",
         config=config,
@@ -289,24 +279,6 @@ def _build_train_and_val_loaders(
         shuffle=False,
     )
     return train_loader, val_loader
-
-
-def _log_dual_branch_dataset_stats(split_name: str, dataset: Any) -> None:
-    if not hasattr(dataset, "get_statistics"):
-        return
-    stats = dataset.get_statistics()
-    logging.info(
-        "%s images=%s total_patches=%s avg_patches_per_image=%.2f min_patches=%s max_patches=%s avg_selected_patches=%.2f min_selected=%s max_selected=%s",
-        split_name,
-        stats.get("num_images", 0),
-        stats.get("total_patches", 0),
-        stats.get("avg_patches_per_image", 0.0),
-        stats.get("min_patches_per_image", 0),
-        stats.get("max_patches_per_image", 0),
-        stats.get("avg_selected_patches_per_image", 0.0),
-        stats.get("min_selected_patches_per_image", 0),
-        stats.get("max_selected_patches_per_image", 0),
-    )
 
 
 def run_training(config: dict[str, Any]) -> Path:
@@ -325,10 +297,7 @@ def run_training(config: dict[str, Any]) -> Path:
     logging.info("AMP enabled: %s", use_amp)
     logging.info("Task mode: %s", task_mode)
 
-    split_dir = resolve_path(config.get("build_patch_splits", {}).get("output_dir", "data/splits"))
-    label_mapping_path = resolve_path(config.get("build_patch_splits", {}).get("label_mapping_path", "data/splits/label_mapping.json"))
-    train_csv = split_dir / "train.csv"
-    val_csv = split_dir / "val.csv"
+    train_csv, val_csv, label_mapping_path = _resolve_split_csvs(config, task_mode)
     label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
     num_classes = len(label_names) if label_names is not None else config.get("data", {}).get("num_classes")
 
@@ -343,29 +312,21 @@ def run_training(config: dict[str, Any]) -> Path:
     model = build_model(config).to(device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
-    if task_mode == "dual_branch":
-        class_counts = compute_image_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
-    else:
-        class_counts = compute_patch_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
+    class_counts = compute_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
     criterion = build_loss(config, class_counts=class_counts, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
-    if task_mode == "dual_branch":
-        dual_branch_config = config.get("dual_branch", {})
+    if task_mode == "whole_image":
+        whole_image_config = config.get("whole_image", {})
         logging.info(
-            "Dual branch: whole_backbone=%s patch_backbone=%s fusion=%s patch_pooling=%s max_patches_per_image=%s whole_image_size=%s",
-            dual_branch_config.get("whole_backbone", config.get("model", {}).get("name", "resnet18")),
-            dual_branch_config.get("patch_backbone", config.get("model", {}).get("name", "resnet18")),
-            dual_branch_config.get("fusion", "concat"),
-            dual_branch_config.get("patch_pooling", "mean"),
-            dual_branch_config.get("max_patches_per_image", "all"),
-            dual_branch_config.get("whole_image_size", 512),
+            "Whole image: image_size=%s resize_size=%s interpolation=%s",
+            whole_image_config.get("image_size", 512),
+            whole_image_config.get("resize_size", whole_image_config.get("image_size", 512)),
+            whole_image_config.get("interpolation", "bilinear"),
         )
         logging.info("Train images: %s | Val images: %s", len(train_loader.dataset), len(val_loader.dataset))
-        _log_dual_branch_dataset_stats("Train", train_loader.dataset)
-        _log_dual_branch_dataset_stats("Val", val_loader.dataset)
         logging.info("Validation: direct image-level metrics from model logits")
     else:
         logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))

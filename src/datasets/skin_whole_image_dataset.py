@@ -9,14 +9,14 @@ import pandas as pd
 from PIL import Image, UnidentifiedImageError
 from torch.utils.data import DataLoader, Dataset
 
-from src.datasets.transforms import build_patch_transforms
+from src.datasets.transforms import build_whole_image_transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-REQUIRED_COLUMNS = {"patch_path", "label"}
+REQUIRED_COLUMNS = {"source_image", "label"}
 
 
-class SkinPatchDataset(Dataset):
-    """Patch classification dataset backed by a split CSV file."""
+class SkinWholeImageDataset(Dataset):
+    """Whole-image classification dataset backed by an image-level split CSV."""
 
     def __init__(
         self,
@@ -24,6 +24,7 @@ class SkinPatchDataset(Dataset):
         mode: str,
         transform: Any = None,
         transform_config: dict[str, Any] | None = None,
+        whole_image_config: dict[str, Any] | None = None,
         label_mapping: dict[str, int] | None = None,
         label_mapping_path: str | Path | None = None,
         project_root: str | Path | None = None,
@@ -36,32 +37,36 @@ class SkinPatchDataset(Dataset):
         self.project_root = Path(project_root) if project_root is not None else PROJECT_ROOT
         self.samples = self._load_samples(self.csv_file)
         self.label_mapping = self._build_label_mapping(label_mapping, label_mapping_path)
-        self.transform = transform or build_patch_transforms(self.mode, transform_config)
+        self.transform = transform or build_whole_image_transforms(
+            self.mode,
+            transform_cfg=transform_config,
+            whole_image_config=whole_image_config,
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.samples.iloc[index]
-        patch_path = self._resolve_patch_path(row["patch_path"])
+        image_path = self._resolve_image_path(row["source_image"])
 
         try:
-            with Image.open(patch_path) as image:
+            with Image.open(image_path) as image:
                 image = image.convert("RGB")
                 image = np.array(image)
         except FileNotFoundError as exc:
             raise FileNotFoundError(
-                f"Failed to read patch image because the file does not exist: {patch_path} "
+                f"Failed to read source image because the file does not exist: {image_path} "
                 f"(csv: {self.csv_file}, index: {index})"
             ) from exc
         except UnidentifiedImageError as exc:
             raise RuntimeError(
-                f"Failed to decode patch image: {patch_path} "
+                f"Failed to decode source image: {image_path} "
                 f"(csv: {self.csv_file}, index: {index})"
             ) from exc
         except OSError as exc:
             raise RuntimeError(
-                f"Failed to open patch image: {patch_path} "
+                f"Failed to open source image: {image_path} "
                 f"(csv: {self.csv_file}, index: {index})"
             ) from exc
 
@@ -78,11 +83,8 @@ class SkinPatchDataset(Dataset):
             "image": image,
             "label": int(self.label_mapping[label_name]),
             "label_name": label_name,
-            "patch_path": str(row["patch_path"]),
+            "source_image": str(row["source_image"]),
         }
-
-        if "source_image" in row.index:
-            sample["source_image"] = str(row["source_image"])
         if "patient_id" in row.index:
             sample["patient_id"] = "" if pd.isna(row["patient_id"]) else str(row["patient_id"])
         return sample
@@ -96,10 +98,10 @@ class SkinPatchDataset(Dataset):
         if missing_columns:
             raise ValueError(f"Split CSV is missing required columns: {sorted(missing_columns)}")
 
-        dataframe["patch_path"] = dataframe["patch_path"].astype(str)
+        dataframe["source_image"] = dataframe["source_image"].fillna("").astype(str).str.strip()
         dataframe["label"] = dataframe["label"].astype(str)
-        if "source_image" in dataframe.columns:
-            dataframe["source_image"] = dataframe["source_image"].fillna("").astype(str).str.strip()
+        if (dataframe["source_image"].str.len() == 0).any():
+            raise ValueError(f"Split CSV contains empty source_image values: {csv_file}")
         if "patient_id" in dataframe.columns:
             dataframe["patient_id"] = dataframe["patient_id"].fillna("").astype(str).str.strip()
         return dataframe.reset_index(drop=True)
@@ -124,8 +126,8 @@ class SkinPatchDataset(Dataset):
         labels = sorted(self.samples["label"].unique().tolist())
         return {label: idx for idx, label in enumerate(labels)}
 
-    def _resolve_patch_path(self, patch_path: str) -> Path:
-        candidate = Path(patch_path)
+    def _resolve_image_path(self, image_path: str) -> Path:
+        candidate = Path(image_path)
         if candidate.is_absolute():
             return candidate
 
@@ -136,7 +138,7 @@ class SkinPatchDataset(Dataset):
         return (self.project_root / candidate).resolve()
 
 
-def build_dataloader(
+def build_whole_image_dataloader(
     csv_file: str | Path,
     mode: str,
     config: dict[str, Any],
@@ -149,11 +151,13 @@ def build_dataloader(
     dataloader_config = config.get("dataloader", {})
     split_config = config.get("build_patch_splits", {})
     transform_config = config.get("augmentation", {})
+    whole_image_config = config.get("whole_image", {})
 
-    dataset = SkinPatchDataset(
+    dataset = SkinWholeImageDataset(
         csv_file=csv_file,
         mode=mode,
         transform_config=transform_config,
+        whole_image_config=whole_image_config,
         label_mapping_path=label_mapping_path or split_config.get("label_mapping_path"),
         project_root=project_root,
     )
@@ -163,8 +167,12 @@ def build_dataloader(
     if drop_last is None:
         drop_last = bool(mode.lower() == "train" and dataloader_config.get("drop_last", False))
 
-    batch_size = int(train_config.get("batch_size", dataloader_config.get("batch_size", 16)))
-    num_workers = int(train_config.get("num_workers", dataloader_config.get("num_workers", 0)))
+    batch_size = int(
+        whole_image_config.get("batch_size", train_config.get("batch_size", dataloader_config.get("batch_size", 16)))
+    )
+    num_workers = int(
+        whole_image_config.get("num_workers", train_config.get("num_workers", dataloader_config.get("num_workers", 0)))
+    )
     pin_memory = bool(dataloader_config.get("pin_memory", False))
 
     return DataLoader(
@@ -174,24 +182,4 @@ def build_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,
-    )
-
-
-def build_patch_dataloader(
-    csv_file: str | Path,
-    mode: str,
-    config: dict[str, Any],
-    label_mapping_path: str | Path | None = None,
-    shuffle: bool | None = None,
-    drop_last: bool | None = None,
-    project_root: str | Path | None = None,
-) -> DataLoader:
-    return build_dataloader(
-        csv_file=csv_file,
-        mode=mode,
-        config=config,
-        label_mapping_path=label_mapping_path,
-        shuffle=shuffle,
-        drop_last=drop_last,
-        project_root=project_root,
     )

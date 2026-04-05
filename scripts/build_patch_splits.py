@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -21,6 +21,7 @@ from src.utils.io import load_yaml
 
 REQUIRED_COLUMNS = ["patch_path", "label", "source_image"]
 SPLIT_EXPORT_COLUMNS = ["patch_path", "label", "label_idx", "source_image", "patient_id", "patch_row", "patch_col", "split"]
+IMAGE_SPLIT_EXPORT_COLUMNS = ["source_image", "label", "label_idx", "patient_id", "split"]
 SPLIT_NAMES = ("train", "val", "test")
 COVERAGE_SPLITS = ("train", "val", "test")
 LIMITED_IMAGE_PRIORITY = ("train", "test", "val")
@@ -466,6 +467,56 @@ def export_split_files(dataframe: pd.DataFrame, output_dir: Path) -> None:
         save_dataframe(split_df[export_columns], output_dir / f"{split_name}.csv")
 
 
+def build_image_level_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    image_records: list[dict[str, Any]] = []
+    for source_image, group_df in dataframe.groupby("source_image", sort=True):
+        labels = sorted(group_df["label"].astype(str).unique().tolist())
+        if len(labels) != 1:
+            raise ValueError(
+                "Each source_image must contain exactly one class label before exporting image-level splits. "
+                f"source_image={source_image!r}, labels={labels}"
+            )
+
+        split_values = sorted(group_df["split"].astype(str).unique().tolist())
+        if len(split_values) != 1:
+            raise ValueError(
+                "Each source_image must belong to exactly one split before exporting image-level splits. "
+                f"source_image={source_image!r}, splits={split_values}"
+            )
+
+        record: dict[str, Any] = {
+            "source_image": str(source_image),
+            "label": labels[0],
+            "split": split_values[0],
+        }
+        if "label_idx" in group_df.columns:
+            label_indices = sorted(group_df["label_idx"].astype(int).unique().tolist())
+            if len(label_indices) != 1:
+                raise ValueError(
+                    "Each source_image must map to exactly one label_idx before exporting image-level splits. "
+                    f"source_image={source_image!r}, label_idx={label_indices}"
+                )
+            record["label_idx"] = int(label_indices[0])
+        if "patient_id" in group_df.columns:
+            patient_values = [value for value in group_df["patient_id"].fillna("").astype(str).str.strip().tolist() if value]
+            record["patient_id"] = patient_values[0] if patient_values else ""
+        image_records.append(record)
+
+    image_dataframe = pd.DataFrame(image_records)
+    ordered_columns = [column for column in IMAGE_SPLIT_EXPORT_COLUMNS if column in image_dataframe.columns]
+    extra_columns = [column for column in image_dataframe.columns if column not in ordered_columns]
+    return image_dataframe[ordered_columns + extra_columns].sort_values(by=["split", "label", "source_image"]).reset_index(drop=True)
+
+
+def export_image_split_files(dataframe: pd.DataFrame, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_dataframe = build_image_level_dataframe(dataframe)
+    export_columns = [column for column in IMAGE_SPLIT_EXPORT_COLUMNS if column in image_dataframe.columns]
+    for split_name in SPLIT_NAMES:
+        split_df = image_dataframe[image_dataframe["split"] == split_name].copy()
+        save_dataframe(split_df[export_columns], output_dir / f"{split_name}_images.csv")
+
+
 def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
     dataframe = load_patch_metadata(config.metadata_path)
     dataframe, effective_group_by = assign_group_keys(dataframe, config.group_by)
@@ -498,6 +549,7 @@ def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
 
     save_dataframe(dataframe, config.all_patches_path)
     export_split_files(dataframe, config.output_dir)
+    export_image_split_files(dataframe, config.output_dir)
     save_label_mapping(label_mapping, config.label_mapping_path)
 
     summary = summarize_splits(
@@ -513,6 +565,8 @@ def run_split_builder(config: SplitBuildConfig) -> dict[str, Any]:
     log_per_class_image_summary(per_class_image_counts, per_class_image_distribution)
     log_split_summary(summary)
     logging.info("Saved all patches file to %s", config.all_patches_path)
+    logging.info("Saved patch-level split files to %s", config.output_dir)
+    logging.info("Saved image-level split files to %s", config.output_dir)
     logging.info("Saved label mapping to %s", config.label_mapping_path)
     return summary
 
