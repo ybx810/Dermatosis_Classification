@@ -80,6 +80,22 @@ def _resolve_interpolation(interpolation: str | None) -> int:
     return interpolation_map[interpolation_name]
 
 
+def _resolve_pad_position(pad_position: str | None) -> str:
+    position = str(pad_position or "center").lower()
+    valid_positions = {"center", "top_left", "top_right", "bottom_left", "bottom_right", "random"}
+    if position not in valid_positions:
+        raise ValueError(f"Unsupported pad_position: {position}. Expected one of {sorted(valid_positions)}.")
+    return position
+
+
+def _resolve_pad_fill(
+    pad_value: int | float | list[int] | list[float] | tuple[int, ...] | tuple[float, ...] | None,
+) -> float | tuple[float, ...]:
+    if isinstance(pad_value, (list, tuple)):
+        return tuple(float(value) for value in pad_value)
+    return float(pad_value or 0)
+
+
 def build_whole_image_transforms(
     mode: str,
     transform_cfg: dict[str, Any] | None = None,
@@ -87,9 +103,13 @@ def build_whole_image_transforms(
 ) -> A.Compose:
     transform_cfg = transform_cfg or {}
     whole_image_config = whole_image_config or {}
+    cache_config = whole_image_config.get("cache", {})
     mode = mode.lower()
     if mode not in {"train", "val", "test"}:
         raise ValueError(f"Unsupported mode: {mode}")
+
+    if cache_config.get("size") is not None and int(cache_config.get("size")) <= 0:
+        raise ValueError("whole_image.cache.size must be a positive integer when provided.")
 
     horizontal_flip = float(transform_cfg.get("horizontal_flip", 0.0))
     vertical_flip = float(transform_cfg.get("vertical_flip", 0.0))
@@ -101,16 +121,22 @@ def build_whole_image_transforms(
         or transform_cfg.get("resize_height")
         or 512
     )
-    resize_size = int(whole_image_config.get("resize_size", image_size))
-    if resize_size < image_size:
-        raise ValueError(
-            f"whole_image.resize_size must be >= whole_image.image_size, got {resize_size} < {image_size}."
-        )
-    interpolation = _resolve_interpolation(whole_image_config.get("interpolation", "bilinear"))
+    interpolation = _resolve_interpolation(whole_image_config.get("interpolation", "area"))
+    pad_position = _resolve_pad_position(whole_image_config.get("pad_position", "center"))
+    pad_fill = _resolve_pad_fill(whole_image_config.get("pad_value", 0))
 
+    # Keep one geometry path for cached whole-image inputs and raw fallback.
+    # When cache.size > image_size this becomes a light resize of the cached square image,
+    # while missing-cache fallback still preserves aspect ratio and pads raw source images safely.
     transforms: list[A.BasicTransform] = [
-        A.Resize(height=resize_size, width=resize_size, interpolation=interpolation),
-        A.CenterCrop(height=image_size, width=image_size),
+        A.LongestMaxSize(max_size=image_size, interpolation=interpolation),
+        A.PadIfNeeded(
+            min_height=image_size,
+            min_width=image_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=pad_fill,
+            position=pad_position,
+        ),
     ]
     if mode == "train":
         if horizontal_flip > 0:

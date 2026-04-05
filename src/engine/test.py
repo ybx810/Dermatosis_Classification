@@ -85,14 +85,39 @@ def _load_label_names(label_mapping_path: Path | None, num_classes: int | None =
     return None
 
 
+def _save_per_class_metrics_csv(metrics: dict[str, Any], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "class_index",
+        "class_name",
+        "precision",
+        "recall",
+        "f1",
+        "support",
+        "predicted_count",
+        "true_count",
+        "specificity",
+        "one_vs_rest_accuracy",
+    ]
+    dataframe = pd.DataFrame(metrics.get("per_class_metrics", []))
+    if dataframe.empty:
+        dataframe = pd.DataFrame(columns=columns)
+    else:
+        dataframe = dataframe.reindex(columns=columns)
+    dataframe.to_csv(output_path, index=False, encoding="utf-8")
+    return output_path
+
+
 def _save_level_artifacts(metrics: dict[str, Any], output_dir: Path, prefix: str) -> None:
     metrics_path = save_metrics_json(metrics, output_dir / f"{prefix}_metrics.json")
+    per_class_csv_path = _save_per_class_metrics_csv(metrics, output_dir / f"{prefix}_per_class_metrics.csv")
     confusion_path = save_confusion_matrix_figure(
         confusion=metrics["confusion_matrix"],
         label_names=metrics["labels"],
         output_path=output_dir / f"{prefix}_confusion_matrix.png",
     )
     logging.info("Saved %s metrics to %s", prefix, metrics_path)
+    logging.info("Saved %s per-class metrics to %s", prefix, per_class_csv_path)
     logging.info("Saved %s confusion matrix to %s", prefix, confusion_path)
 
 

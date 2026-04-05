@@ -46,11 +46,22 @@ build_patch_splits:
 
 whole_image:
   image_size: 512
-  resize_size: 544
-  interpolation: bilinear
+  interpolation: area
+  pad_value: 0
+  pad_position: center
   train_csv: data/splits/train_images.csv
   val_csv: data/splits/val_images.csv
   test_csv: data/splits/test_images.csv
+  cache:
+    enabled: true
+    dir: data/cache/whole_images
+    metadata_path: data/metadata/whole_image_metadata.csv
+    summary_path: data/metadata/whole_image_summary.json
+    size: 1024
+    format: png
+    overwrite: false
+    num_workers: 4
+    use_cached_for_training: true
 
 evaluation:
   level: both
@@ -79,7 +90,7 @@ augmentation:
   normalize: imagenet
 
 model:
-  name: resnet18
+  name: efficientnet_b0
   pretrained: true
   dropout: 0.3
 

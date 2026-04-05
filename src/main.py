@@ -320,11 +320,14 @@ def run_training(config: dict[str, Any]) -> Path:
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
     if task_mode == "whole_image":
         whole_image_config = config.get("whole_image", {})
+        cache_config = whole_image_config.get("cache", {})
         logging.info(
-            "Whole image: image_size=%s resize_size=%s interpolation=%s",
+            "Whole image: image_size=%s cache_size=%s interpolation=%s cache_enabled=%s cached_inputs=%s",
             whole_image_config.get("image_size", 512),
-            whole_image_config.get("resize_size", whole_image_config.get("image_size", 512)),
-            whole_image_config.get("interpolation", "bilinear"),
+            cache_config.get("size"),
+            whole_image_config.get("interpolation", "area"),
+            cache_config.get("enabled", False),
+            cache_config.get("use_cached_for_training", True),
         )
         logging.info("Train images: %s | Val images: %s", len(train_loader.dataset), len(val_loader.dataset))
         logging.info("Validation: direct image-level metrics from model logits")

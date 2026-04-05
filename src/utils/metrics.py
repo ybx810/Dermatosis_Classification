@@ -12,6 +12,7 @@ from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
     f1_score,
+    precision_recall_fscore_support,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -28,29 +29,12 @@ VALID_EVALUATION_LEVELS = {"patch", "image", "both"}
 VALID_AGGREGATIONS = {"mean_prob", "majority_vote", "max_prob"}
 
 
-def compute_classification_metrics(
-    targets: list[int] | np.ndarray,
-    predictions: list[int] | np.ndarray,
-    probabilities: list[list[float]] | np.ndarray | None = None,
+def _resolve_classification_label_space(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray | None = None,
     label_names: list[str] | None = None,
-) -> dict[str, Any]:
-    """Compute stable multi-class classification metrics."""
-
-    y_true = np.asarray(targets, dtype=np.int64)
-    y_pred = np.asarray(predictions, dtype=np.int64)
-    y_prob = None if probabilities is None else np.asarray(probabilities, dtype=np.float64)
-
-    if y_true.size == 0:
-        return {
-            "accuracy": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "macro_f1": 0.0,
-            "auc_ovr": None,
-            "confusion_matrix": [],
-            "labels": label_names or [],
-        }
-
+) -> tuple[list[int], list[str]]:
     inferred_num_classes = None
     if y_prob is not None:
         if y_prob.ndim != 2 or y_prob.shape[0] != y_true.shape[0]:
@@ -63,13 +47,91 @@ def compute_classification_metrics(
                 "label_names length must match the probability dimension: "
                 f"{len(label_names)} vs {inferred_num_classes}."
             )
-        labels = list(range(len(label_names)))
-    elif inferred_num_classes is not None:
+        return list(range(len(label_names))), list(label_names)
+
+    if inferred_num_classes is not None:
         labels = list(range(inferred_num_classes))
-        label_names = [str(label) for label in labels]
-    else:
-        labels = sorted({*y_true.tolist(), *y_pred.tolist()})
-        label_names = [str(label) for label in labels]
+        return labels, [str(label) for label in labels]
+
+    labels = sorted({*y_true.tolist(), *y_pred.tolist()})
+    return labels, [str(label) for label in labels]
+
+
+def compute_per_class_metrics(
+    targets: list[int] | np.ndarray,
+    predictions: list[int] | np.ndarray,
+    label_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    y_true = np.asarray(targets, dtype=np.int64)
+    y_pred = np.asarray(predictions, dtype=np.int64)
+    if y_true.shape[0] != y_pred.shape[0]:
+        raise ValueError("targets and predictions must have the same length.")
+
+    labels, resolved_label_names = _resolve_classification_label_space(y_true, y_pred, label_names=label_names)
+    if not labels:
+        return []
+
+    precisions, recalls, f1_scores, supports = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=labels,
+        average=None,
+        zero_division=0,
+    )
+    confusion = confusion_matrix(y_true, y_pred, labels=labels)
+    predicted_counts = confusion.sum(axis=0)
+    true_counts = confusion.sum(axis=1)
+    total_samples = int(confusion.sum())
+
+    per_class_metrics: list[dict[str, Any]] = []
+    for class_index, class_name in enumerate(resolved_label_names):
+        tp = int(confusion[class_index, class_index])
+        fp = int(predicted_counts[class_index] - tp)
+        fn = int(true_counts[class_index] - tp)
+        tn = total_samples - tp - fp - fn
+        specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+        one_vs_rest_accuracy = float((tp + tn) / total_samples) if total_samples > 0 else 0.0
+        per_class_metrics.append(
+            {
+                "class_index": int(labels[class_index]),
+                "class_name": str(class_name),
+                "precision": float(precisions[class_index]),
+                "recall": float(recalls[class_index]),
+                "f1": float(f1_scores[class_index]),
+                "support": int(supports[class_index]),
+                "predicted_count": int(predicted_counts[class_index]),
+                "true_count": int(true_counts[class_index]),
+                "specificity": specificity,
+                "one_vs_rest_accuracy": one_vs_rest_accuracy,
+            }
+        )
+    return per_class_metrics
+
+
+def compute_classification_metrics(
+    targets: list[int] | np.ndarray,
+    predictions: list[int] | np.ndarray,
+    probabilities: list[list[float]] | np.ndarray | None = None,
+    label_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Compute stable multi-class classification metrics."""
+
+    y_true = np.asarray(targets, dtype=np.int64)
+    y_pred = np.asarray(predictions, dtype=np.int64)
+    y_prob = None if probabilities is None else np.asarray(probabilities, dtype=np.float64)
+    labels, resolved_label_names = _resolve_classification_label_space(y_true, y_pred, y_prob=y_prob, label_names=label_names)
+
+    if y_true.size == 0:
+        return {
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "macro_f1": 0.0,
+            "auc_ovr": None,
+            "confusion_matrix": [],
+            "labels": resolved_label_names,
+            "per_class_metrics": compute_per_class_metrics([], [], label_names=resolved_label_names),
+        }
 
     metrics: dict[str, Any] = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
@@ -77,8 +139,9 @@ def compute_classification_metrics(
         "recall": float(recall_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
         "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
-        "labels": label_names,
+        "labels": resolved_label_names,
         "auc_ovr": None,
+        "per_class_metrics": compute_per_class_metrics(y_true, y_pred, label_names=resolved_label_names),
     }
 
     if y_prob is not None:
@@ -325,6 +388,7 @@ def compute_multilevel_classification_metrics(
         "auc_ovr": primary_metrics.get("auc_ovr"),
         "confusion_matrix": primary_metrics["confusion_matrix"],
         "labels": primary_metrics["labels"],
+        "per_class_metrics": primary_metrics["per_class_metrics"],
     }
 
     if resolved_config["should_report_patch"]:
@@ -488,6 +552,7 @@ def build_single_level_evaluation_result(
         "auc_ovr": metrics.get("auc_ovr"),
         "confusion_matrix": metrics["confusion_matrix"],
         "labels": metrics["labels"],
+        "per_class_metrics": metrics["per_class_metrics"],
         f"{level_name}_metrics": metrics,
         f"{level_name}_accuracy": float(metrics["accuracy"]),
         f"{level_name}_precision": float(metrics["precision"]),
