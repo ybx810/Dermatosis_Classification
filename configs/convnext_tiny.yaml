@@ -1,41 +1,46 @@
-﻿project:
-  name: large-medical-image-patch-classification
-  task: patch-classification
+project:
+  name: large-medical-image-whole-image-classification-convnext-tiny
+  task: whole-image-classification
   output_dir: outputs
+
+task:
+  mode: whole_image
 
 data:
   raw_dir: G:\18disease_full
-  patch_dir: data/patches
   metadata_dir: data/metadata
   split_dir: data/splits
   cache_dir: data/cache
-  patch_size: 512
   num_classes: 18
-  image_extension: .png
 
-prepare_patches:
-  raw_dir: G:\18disease_full
-  output_dir: data/cache/patches
-  metadata_path: data/metadata/patch_metadata.csv
-  summary_path: data/metadata/patch_summary.json
-  patch_size: 512
-  stride: 512
-  edge_mode: drop
-  save_format:
-  pad_value: 0
-  patient_id_strategy: auto
-
-build_patch_splits:
-  metadata_path: data/metadata/patch_metadata.csv
+build_image_splits:
   output_dir: data/splits
-  all_patches_path: data/splits/all_patches.csv
   label_mapping_path: data/splits/label_mapping.json
   summary_path: data/splits/split_summary.json
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
   seed: 42
-  group_by: auto
+
+whole_image:
+  train_csv: data/splits/train_images.csv
+  val_csv: data/splits/val_images.csv
+  test_csv: data/splits/test_images.csv
+  image_size: 512
+  interpolation: area
+  pad_value: 0
+  pad_position: center
+  max_image_pixels:
+  cache:
+    enabled: true
+    dir: data/cache/whole_images
+    metadata_path: data/metadata/whole_image_metadata.csv
+    summary_path: data/metadata/whole_image_summary.json
+    size: 1024
+    format: png
+    overwrite: false
+    num_workers: 4
+    use_cached_for_training: true
 
 train:
   batch_size: 16
@@ -50,9 +55,6 @@ dataloader:
   drop_last: false
 
 augmentation:
-  resize_height: 544
-  resize_width: 544
-  crop_size: 512
   horizontal_flip: 0.5
   vertical_flip: 0.5
   normalize: imagenet
@@ -82,3 +84,6 @@ scheduler:
   eta_min: 0.0
   factor: 0.1
   patience: 2
+
+evaluation:
+  primary_metric: macro_f1

@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.datasets import build_patch_dataloader, build_whole_image_dataloader
+from src.datasets import build_whole_image_dataloader
 from src.engine import train_one_epoch, validate
 from src.losses import build_loss
 from src.models import build_model
@@ -25,12 +25,12 @@ from src.utils.io import load_yaml
 from src.utils.seed import seed_everything
 from src.utils.visualize import export_training_visualizations
 
-
-SUPPORTED_TASK_MODES = {"patch", "whole_image"}
+SUPPORTED_TASK_MODE = "whole_image"
+SUPPORTED_PRIMARY_METRICS = {"accuracy", "precision", "recall", "macro_f1", "auc_ovr"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a medical image classifier.")
+    parser = argparse.ArgumentParser(description="Train a whole-image medical image classifier.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     return parser.parse_args()
 
@@ -59,7 +59,7 @@ def resolve_path(path_value: str | Path | None) -> Path | None:
 
 
 def build_run_dir(config: dict[str, Any]) -> Path:
-    project_name = str(config.get("project", {}).get("name", "patch-classification"))
+    project_name = str(config.get("project", {}).get("name", "whole-image-classification"))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = resolve_path(config.get("project", {}).get("output_dir", "outputs"))
     run_dir = output_root / project_name / timestamp
@@ -126,11 +126,20 @@ def build_scheduler(
     raise ValueError(f"Unsupported scheduler: {name}")
 
 
-def _get_task_mode(config: dict[str, Any]) -> str:
-    task_mode = str(config.get("task", {}).get("mode", "patch")).lower()
-    if task_mode not in SUPPORTED_TASK_MODES:
-        raise ValueError(f"Unsupported task.mode: {task_mode}. Expected one of {sorted(SUPPORTED_TASK_MODES)}")
-    return task_mode
+def _validate_task_mode(config: dict[str, Any]) -> None:
+    task_mode = str(config.get("task", {}).get("mode", SUPPORTED_TASK_MODE)).lower()
+    if task_mode != SUPPORTED_TASK_MODE:
+        raise ValueError("This project only supports task.mode=whole_image.")
+
+
+def _resolve_primary_metric(config: dict[str, Any]) -> str:
+    primary_metric = str(config.get("evaluation", {}).get("primary_metric", "macro_f1")).lower()
+    if primary_metric not in SUPPORTED_PRIMARY_METRICS:
+        raise ValueError(
+            f"Unsupported evaluation.primary_metric: {primary_metric}. "
+            f"Expected one of {sorted(SUPPORTED_PRIMARY_METRICS)}."
+        )
+    return primary_metric
 
 
 def compute_class_counts(
@@ -195,93 +204,29 @@ def save_checkpoint(
     )
 
 
-def _append_validation_metrics(epoch_record: dict[str, Any], val_metrics: dict[str, Any]) -> None:
-    epoch_record["val_primary_level"] = val_metrics.get("primary_metric_level", "patch")
-
-    if "patch_accuracy" in val_metrics:
-        epoch_record["val_patch_accuracy"] = val_metrics["patch_accuracy"]
-        epoch_record["val_patch_macro_f1"] = val_metrics["patch_macro_f1"]
-        epoch_record["val_patch_precision"] = val_metrics["patch_precision"]
-        epoch_record["val_patch_recall"] = val_metrics["patch_recall"]
-        epoch_record["val_patch_auc_ovr"] = val_metrics.get("patch_auc_ovr")
-
-    if "image_accuracy" in val_metrics:
-        epoch_record["val_image_accuracy"] = val_metrics["image_accuracy"]
-        epoch_record["val_image_macro_f1"] = val_metrics["image_macro_f1"]
-        epoch_record["val_image_precision"] = val_metrics["image_precision"]
-        epoch_record["val_image_recall"] = val_metrics["image_recall"]
-        epoch_record["val_image_auc_ovr"] = val_metrics.get("image_auc_ovr")
-
-
 def _resolve_split_dir(config: dict[str, Any]) -> Path:
     return resolve_path(
-        config.get("data", {}).get("split_dir") or config.get("build_patch_splits", {}).get("output_dir") or "data/splits"
+        config.get("data", {}).get("split_dir") or config.get("build_image_splits", {}).get("output_dir") or "data/splits"
     )
 
 
 def _resolve_label_mapping_path(config: dict[str, Any], split_dir: Path) -> Path:
-    return resolve_path(config.get("build_patch_splits", {}).get("label_mapping_path") or split_dir / "label_mapping.json")
+    return resolve_path(config.get("build_image_splits", {}).get("label_mapping_path") or split_dir / "label_mapping.json")
 
 
-def _resolve_split_csvs(config: dict[str, Any], task_mode: str) -> tuple[Path, Path, Path]:
+def _resolve_split_csvs(config: dict[str, Any]) -> tuple[Path, Path, Path]:
     split_dir = _resolve_split_dir(config)
     label_mapping_path = _resolve_label_mapping_path(config, split_dir)
-
-    if task_mode == "whole_image":
-        whole_image_config = config.get("whole_image", {})
-        train_csv = resolve_path(whole_image_config.get("train_csv") or split_dir / "train_images.csv")
-        val_csv = resolve_path(whole_image_config.get("val_csv") or split_dir / "val_images.csv")
-        return train_csv, val_csv, label_mapping_path
-
-    train_csv = split_dir / "train.csv"
-    val_csv = split_dir / "val.csv"
+    whole_image_config = config.get("whole_image", {})
+    train_csv = resolve_path(whole_image_config.get("train_csv") or split_dir / "train_images.csv")
+    val_csv = resolve_path(whole_image_config.get("val_csv") or split_dir / "val_images.csv")
     return train_csv, val_csv, label_mapping_path
 
 
-def _build_train_and_val_loaders(
-    config: dict[str, Any],
-    train_csv: Path,
-    val_csv: Path,
-    label_mapping_path: Path | None,
-    task_mode: str,
-) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    if task_mode == "whole_image":
-        train_loader = build_whole_image_dataloader(
-            csv_file=train_csv,
-            mode="train",
-            config=config,
-            label_mapping_path=label_mapping_path,
-            project_root=PROJECT_ROOT,
-        )
-        val_loader = build_whole_image_dataloader(
-            csv_file=val_csv,
-            mode="val",
-            config=config,
-            label_mapping_path=label_mapping_path,
-            project_root=PROJECT_ROOT,
-            shuffle=False,
-        )
-        return train_loader, val_loader
-
-    train_loader = build_patch_dataloader(
-        csv_file=train_csv,
-        mode="train",
-        config=config,
-        label_mapping_path=label_mapping_path,
-        project_root=PROJECT_ROOT,
-    )
-    val_loader = build_patch_dataloader(
-        csv_file=val_csv,
-        mode="val",
-        config=config,
-        label_mapping_path=label_mapping_path,
-        project_root=PROJECT_ROOT,
-        shuffle=False,
-    )
-    return train_loader, val_loader
-
-
 def run_training(config: dict[str, Any]) -> Path:
+    _validate_task_mode(config)
+    primary_metric = _resolve_primary_metric(config)
+
     seed = int(config.get("train", {}).get("seed", 42))
     seed_everything(seed)
 
@@ -291,22 +236,30 @@ def run_training(config: dict[str, Any]) -> Path:
 
     device = select_device(config)
     use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
-    task_mode = _get_task_mode(config)
     logging.info("Run directory: %s", run_dir)
     logging.info("Device: %s", device)
     logging.info("AMP enabled: %s", use_amp)
-    logging.info("Task mode: %s", task_mode)
+    logging.info("Task mode: %s", SUPPORTED_TASK_MODE)
+    logging.info("Primary validation metric: %s", primary_metric)
 
-    train_csv, val_csv, label_mapping_path = _resolve_split_csvs(config, task_mode)
+    train_csv, val_csv, label_mapping_path = _resolve_split_csvs(config)
     label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
     num_classes = len(label_names) if label_names is not None else config.get("data", {}).get("num_classes")
 
-    train_loader, val_loader = _build_train_and_val_loaders(
+    train_loader = build_whole_image_dataloader(
+        csv_file=train_csv,
+        mode="train",
         config=config,
-        train_csv=train_csv,
-        val_csv=val_csv,
         label_mapping_path=label_mapping_path,
-        task_mode=task_mode,
+        project_root=PROJECT_ROOT,
+    )
+    val_loader = build_whole_image_dataloader(
+        csv_file=val_csv,
+        mode="val",
+        config=config,
+        label_mapping_path=label_mapping_path,
+        project_root=PROJECT_ROOT,
+        shuffle=False,
     )
 
     model = build_model(config).to(device)
@@ -316,28 +269,19 @@ def run_training(config: dict[str, Any]) -> Path:
     criterion = build_loss(config, class_counts=class_counts, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    whole_image_config = config.get("whole_image", {})
+    cache_config = whole_image_config.get("cache", {})
     logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
-    if task_mode == "whole_image":
-        whole_image_config = config.get("whole_image", {})
-        cache_config = whole_image_config.get("cache", {})
-        logging.info(
-            "Whole image: image_size=%s cache_size=%s interpolation=%s cache_enabled=%s cached_inputs=%s",
-            whole_image_config.get("image_size", 512),
-            cache_config.get("size"),
-            whole_image_config.get("interpolation", "area"),
-            cache_config.get("enabled", False),
-            cache_config.get("use_cached_for_training", True),
-        )
-        logging.info("Train images: %s | Val images: %s", len(train_loader.dataset), len(val_loader.dataset))
-        logging.info("Validation: direct image-level metrics from model logits")
-    else:
-        logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
-        logging.info(
-            "Evaluation: level=%s aggregation=%s",
-            config.get("evaluation", {}).get("level", "both"),
-            config.get("evaluation", {}).get("aggregation", "mean_prob"),
-        )
+    logging.info(
+        "Whole image config | image_size=%s cache_size=%s interpolation=%s cache_enabled=%s cached_inputs=%s",
+        whole_image_config.get("image_size", 512),
+        cache_config.get("size"),
+        whole_image_config.get("interpolation", "area"),
+        cache_config.get("enabled", False),
+        cache_config.get("use_cached_for_training", True),
+    )
+    logging.info("Train images: %s | Val images: %s", len(train_loader.dataset), len(val_loader.dataset))
 
     num_epochs = int(config.get("train", {}).get("epochs", 20))
     history: list[dict[str, float | int | str | None]] = []
@@ -353,7 +297,6 @@ def run_training(config: dict[str, Any]) -> Path:
             epoch=epoch,
             scaler=scaler,
             use_amp=use_amp,
-            task_mode=task_mode,
         )
         val_metrics = validate(
             model=model,
@@ -362,14 +305,15 @@ def run_training(config: dict[str, Any]) -> Path:
             device=device,
             epoch=epoch,
             use_amp=use_amp,
-            evaluation_config=config,
             label_names=label_names,
-            task_mode=task_mode,
         )
 
+        scheduler_metric = val_metrics.get(primary_metric)
+        if scheduler_metric is None:
+            scheduler_metric = val_metrics["macro_f1"]
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_metrics["macro_f1"])
+                scheduler.step(float(scheduler_metric))
             else:
                 scheduler.step()
 
@@ -382,13 +326,15 @@ def run_training(config: dict[str, Any]) -> Path:
             "train_macro_f1": train_metrics["macro_f1"],
             "val_loss": val_metrics["loss"],
             "val_accuracy": val_metrics["accuracy"],
+            "val_precision": val_metrics["precision"],
+            "val_recall": val_metrics["recall"],
             "val_macro_f1": val_metrics["macro_f1"],
+            "val_auc_ovr": val_metrics.get("auc_ovr"),
         }
-        _append_validation_metrics(epoch_record, val_metrics)
         history.append(epoch_record)
 
         logging.info(
-            "Epoch %03d | train_loss=%.4f train_acc=%.4f train_f1=%.4f | val_loss=%.4f val_acc=%.4f val_f1=%.4f | lr=%.6f | val_primary=%s",
+            "Epoch %03d | train_loss=%.4f train_acc=%.4f train_f1=%.4f | val_loss=%.4f val_acc=%.4f val_f1=%.4f val_auc=%s | lr=%.6f",
             epoch,
             train_metrics["loss"],
             train_metrics["accuracy"],
@@ -396,35 +342,18 @@ def run_training(config: dict[str, Any]) -> Path:
             val_metrics["loss"],
             val_metrics["accuracy"],
             val_metrics["macro_f1"],
+            "N/A" if val_metrics.get("auc_ovr") is None else f"{val_metrics['auc_ovr']:.4f}",
             learning_rate,
-            val_metrics.get("primary_metric_level", "patch"),
         )
-        if "patch_accuracy" in val_metrics and val_metrics.get("primary_metric_level") != "patch":
-            logging.info(
-                "Epoch %03d | val_patch_acc=%.4f val_patch_f1=%.4f",
-                epoch,
-                val_metrics["patch_accuracy"],
-                val_metrics["patch_macro_f1"],
-            )
-        if "image_accuracy" in val_metrics:
-            logging.info(
-                "Epoch %03d | val_image_acc=%.4f val_image_f1=%.4f aggregation=%s",
-                epoch,
-                val_metrics["image_accuracy"],
-                val_metrics["image_macro_f1"],
-                val_metrics.get("aggregation", "model_direct"),
-            )
 
         save_checkpoint(run_dir / "last_model.pth", model, optimizer, epoch, epoch_record, config)
-        if val_metrics["macro_f1"] >= best_metric:
-            best_metric = val_metrics["macro_f1"]
+        current_metric = val_metrics.get(primary_metric)
+        if current_metric is None:
+            current_metric = val_metrics["macro_f1"]
+        if float(current_metric) >= best_metric:
+            best_metric = float(current_metric)
             save_checkpoint(run_dir / "best_model.pth", model, optimizer, epoch, epoch_record, config)
-            logging.info(
-                "Updated best model at epoch %03d with %s_macro_f1=%.4f",
-                epoch,
-                val_metrics.get("primary_metric_level", "patch"),
-                best_metric,
-            )
+            logging.info("Updated best model at epoch %03d with %s=%.4f", epoch, primary_metric, best_metric)
 
     history_path = run_dir / "history.json"
     history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")

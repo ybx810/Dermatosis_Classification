@@ -28,12 +28,7 @@ def train_one_epoch(
     epoch: int,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
-    task_mode: str = "patch",
 ) -> dict[str, float]:
-    task_mode = str(task_mode).lower()
-    if task_mode not in {"patch", "whole_image"}:
-        raise ValueError(f"Unsupported task_mode: {task_mode}")
-
     model.train()
 
     running_loss = 0.0

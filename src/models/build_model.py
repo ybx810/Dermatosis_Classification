@@ -6,15 +6,12 @@ import torch.nn as nn
 from torchvision import models
 
 SUPPORTED_BACKBONES = ("resnet18", "resnet50", "efficientnet_b0", "convnext_tiny")
-SUPPORTED_TASK_MODES = {"patch", "whole_image"}
 
 
-def _get_task_mode(config: dict[str, Any]) -> str:
-    task_config = config.get("task", {})
-    task_mode = str(task_config.get("mode", "patch")).lower()
-    if task_mode not in SUPPORTED_TASK_MODES:
-        raise ValueError(f"Unsupported task.mode: {task_mode}. Expected one of {sorted(SUPPORTED_TASK_MODES)}")
-    return task_mode
+def _validate_task_mode(config: dict[str, Any]) -> None:
+    task_mode = str(config.get("task", {}).get("mode", "whole_image")).lower()
+    if task_mode != "whole_image":
+        raise ValueError("This project only supports task.mode=whole_image.")
 
 
 def _get_model_config(config: dict[str, Any]) -> tuple[str, bool, int, float]:
@@ -96,7 +93,8 @@ def _build_convnext_tiny(num_classes: int, pretrained: bool, dropout: float) -> 
     return model
 
 
-def _build_single_input_classifier(config: dict[str, Any]) -> nn.Module:
+def build_model(config: dict[str, Any]) -> nn.Module:
+    _validate_task_mode(config)
     model_name, pretrained, num_classes, dropout = _get_model_config(config)
 
     if model_name == "resnet18":
@@ -112,10 +110,3 @@ def _build_single_input_classifier(config: dict[str, Any]) -> nn.Module:
         f"Unsupported model backbone: {model_name}. "
         f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
     )
-
-
-def build_model(config: dict[str, Any]) -> nn.Module:
-    """Build the single-input classifier used by patch and whole_image modes."""
-
-    _get_task_mode(config)
-    return _build_single_input_classifier(config)

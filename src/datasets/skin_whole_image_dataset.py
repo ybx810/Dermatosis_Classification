@@ -16,8 +16,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_COLUMNS = {"source_image", "label"}
 SUCCESS_CACHE_STATUSES = {"success", "skipped_existing"}
 
-Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def _configure_max_image_pixels(max_image_pixels: int | float | str | None) -> None:
+    if max_image_pixels in (None, "", "null"):
+        Image.MAX_IMAGE_PIXELS = None
+        return
+    Image.MAX_IMAGE_PIXELS = int(max_image_pixels)
 
 
 class SkinWholeImageDataset(Dataset):
@@ -42,6 +48,8 @@ class SkinWholeImageDataset(Dataset):
         self.project_root = Path(project_root) if project_root is not None else PROJECT_ROOT
         self.whole_image_config = whole_image_config or {}
         self.cache_config = self.whole_image_config.get("cache", {})
+        _configure_max_image_pixels(self.whole_image_config.get("max_image_pixels"))
+
         self.samples = self._load_samples(self.csv_file)
         self.label_mapping = self._build_label_mapping(label_mapping, label_mapping_path)
         self.cached_image_mapping = self._load_cached_image_mapping()
@@ -184,8 +192,7 @@ class SkinWholeImageDataset(Dataset):
             if not source_image or not cached_image_path:
                 continue
             mapping[source_image] = cached_image_path
-            resolved_source = self._resolve_image_path(source_image)
-            mapping[str(resolved_source)] = cached_image_path
+            mapping[str(self._resolve_image_path(source_image))] = cached_image_path
 
         logging.info("Loaded %d cached whole-image paths from %s", len(mapping), metadata_path)
         return mapping
@@ -238,7 +245,7 @@ def build_whole_image_dataloader(
 ) -> DataLoader:
     train_config = config.get("train", {})
     dataloader_config = config.get("dataloader", {})
-    split_config = config.get("build_patch_splits", {})
+    split_config = config.get("build_image_splits", {})
     transform_config = config.get("augmentation", {})
     whole_image_config = config.get("whole_image", {})
 

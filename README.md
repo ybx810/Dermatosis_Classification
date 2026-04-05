@@ -1,11 +1,14 @@
-# Large Medical Image Classification
+# Large Medical Whole-Image Classification
 
-This repository now supports exactly two training modes:
+This repository is a pure whole-image classification project.
 
-- `patch`: keep the original patch-based training flow and optional patch-to-image aggregated evaluation.
-- `whole_image`: a pure whole-image baseline that reads one `source_image` per sample and feeds it directly into a single backbone classifier.
+The training, validation, and test sample unit is always one `source_image`.
+The recommended data path is:
 
-The current codebase contains only the patch workflow and the whole-image baseline.
+1. build image-level splits from raw whole images
+2. prepare cached low-resolution whole-image copies offline
+3. train a single-branch classifier on cached whole images
+4. evaluate checkpoints with image-level metrics and per-class metrics
 
 ## Project Layout
 
@@ -26,111 +29,100 @@ The current codebase contains only the patch workflow and the whole-image baseli
     `-- utils/
 ```
 
-## 1. Prepare Patches
+## 1. Build Image Splits
 
-Patch extraction is still the first step for the patch workflow and also provides the metadata used to derive image-level splits:
-
-```bash
-python scripts/prepare_patches.py --config configs/default.yaml
-```
-
-The script scans raw images under `data.raw_dir`, cuts them into patches, filters invalid patches, and writes:
-
-- `data/metadata/patch_metadata.csv`
-- `data/metadata/patch_summary.json`
-- retained patch files under `data/cache/patches/`
-
-## 2. Build Splits
-
-Build the split files after patch extraction:
+Generate image-level train/val/test CSV files directly from the raw whole-image directory:
 
 ```bash
-python scripts/build_patch_splits.py --config configs/default.yaml
+python scripts/build_image_splits.py --config configs/default.yaml
 ```
 
-The split builder keeps `source_image` mutually exclusive across train/val/test and now exports both patch-level and image-level CSVs:
+Outputs:
 
-- Patch-level: `train.csv`, `val.csv`, `test.csv`
-- Image-level: `train_images.csv`, `val_images.csv`, `test_images.csv`
-- Shared label mapping: `label_mapping.json`
-- Summary: `split_summary.json`
+- `data/splits/train_images.csv`
+- `data/splits/val_images.csv`
+- `data/splits/test_images.csv`
+- `data/splits/label_mapping.json`
+- `data/splits/split_summary.json`
 
-Patch split files keep their original format. Whole-image training reads the new `*_images.csv` files only.
+Each row corresponds to one `source_image`. The split builder keeps train/val/test mutually exclusive at image level.
 
-## 3. Prepare Whole-Image Cache
+## 2. Prepare Cached Whole Images
 
-Whole-image training now recommends an offline cache step so the dataloader does not have to reopen and downsample raw giga-pixel source images every batch:
+Prepare cached low-resolution whole-image copies before training:
 
 ```bash
 python scripts/prepare_whole_images.py --config configs/default.yaml
 ```
 
-The script scans the image-level split CSVs, deduplicates `source_image`, and writes:
+Outputs:
 
 - cached whole-image files under `data/cache/whole_images/size_<cache_size>/...`
 - `data/metadata/whole_image_metadata.csv`
 - `data/metadata/whole_image_summary.json`
 
-Each cached whole-image keeps the original aspect ratio, is resized to fit within `whole_image.cache.size`, then padded to a fixed square canvas before being saved. The default cache format is PNG.
+Each cached whole image preserves aspect ratio, is resized to fit within `whole_image.cache.size`, and is padded to a fixed square canvas.
 
-## 4. Patch Mode
+## 3. Train
 
-Use patch mode when you want the original workflow:
-
-```yaml
-task:
-  mode: patch
-```
-
-Behavior in `patch` mode:
-
-- training samples are individual patches from `train.csv`
-- validation/test still use patch predictions
-- image-level metrics are produced by aggregating patch predictions back to `source_image`
-- existing loss, optimizer, scheduler, augmentation, and best-model logic stay on the original patch path
-
-Run training:
-
-```bash
-python scripts/train.py --config configs/default.yaml
-```
-
-Patch evaluation behavior is controlled by the `evaluation` block in the config, for example:
-
-```yaml
-evaluation:
-  level: both
-  aggregation: mean_prob
-  report_patch_metrics: true
-  report_image_metrics: true
-```
-
-Supported aggregation strategies for patch mode are:
-
-- `mean_prob`
-- `majority_vote`
-- `max_prob`
-
-## 5. Whole-Image Baseline
-
-Use whole-image mode for the simple baseline. The default preprocessing avoids aspect-ratio distortion and edge cropping, and the recommended path now uses cached whole-image files instead of raw source images during training and evaluation.
+The default config already targets whole-image training:
 
 ```yaml
 task:
   mode: whole_image
 ```
 
-Relevant config block:
+Run training with:
+
+```bash
+python scripts/train.py --config configs/default.yaml
+```
+
+Behavior:
+
+- one sample equals one `source_image`
+- the dataset prefers `cached_image_path` from `whole_image_metadata.csv`
+- if a cached file is missing, the dataset can fall back to the raw source image
+- the model is a single-input single-output backbone classifier
+- validation uses direct image-level metrics
+- best model selection defaults to validation `macro_f1`
+
+## 4. Test
+
+Evaluate a checkpoint with the same whole-image config:
+
+```bash
+python scripts/test.py --config configs/default.yaml --checkpoint outputs/<project>/<run>/best_model.pth
+```
+
+Test outputs are written to:
+
+```text
+outputs/<project>/<run>/test/
+```
+
+Files written by the test step:
+
+- `metrics.json`
+- `confusion_matrix.png`
+- `per_class_metrics.csv`
+
+`metrics.json` includes image-level accuracy, macro precision, macro recall, macro F1, optional multi-class AUC, confusion matrix, and per-class metrics.
+
+## 5. Key Config
+
+The whole-image config block looks like this:
 
 ```yaml
 whole_image:
+  train_csv: data/splits/train_images.csv
+  val_csv: data/splits/val_images.csv
+  test_csv: data/splits/test_images.csv
   image_size: 512
   interpolation: area
   pad_value: 0
   pad_position: center
-  train_csv: data/splits/train_images.csv
-  val_csv: data/splits/val_images.csv
-  test_csv: data/splits/test_images.csv
+  max_image_pixels: null
   cache:
     enabled: true
     dir: data/cache/whole_images
@@ -143,64 +135,16 @@ whole_image:
     use_cached_for_training: true
 ```
 
-Behavior in `whole_image` mode:
+`image_size` is the final model input size.
+`whole_image.cache.size` is the offline cached whole-image size.
 
-- one sample equals one `source_image`
-- `prepare_whole_images.py` generates one cached low-res whole-image per `source_image`
-- the dataset first looks up `source_image -> cached_image_path` in `whole_image_metadata.csv` and reads the cached image when available
-- raw `source_image` is kept only as a fallback when cache metadata or a cached file is missing
-- cached whole-images use aspect-ratio-preserving resize plus padding to `whole_image.cache.size`
-- the training dataloader then applies only lightweight whole-image transforms to the cached image before feeding it into a single backbone classifier
-- training uses the same loss / optimizer / scheduler framework as patch mode
-- validation/test use direct image-level classification metrics
-- best model is selected by validation image-level `macro_f1`
-
-Run training after switching `task.mode`:
+## 6. Standard Workflow
 
 ```bash
-python scripts/train.py --config configs/default.yaml
-```
-
-## 6. Test a Checkpoint
-
-Evaluate a trained checkpoint with the same config mode used during training:
-
-```bash
-python scripts/test.py --config configs/default.yaml --checkpoint outputs/<project>/<run>/best_model.pth
-```
-
-Outputs are written to:
-
-```text
-outputs/<project>/<run>/test/
-```
-
-Patch mode writes combined metrics and per-level artifacts when patch/image reporting is enabled. Whole-image mode writes image-level metrics and artifacts only.
-
-## 7. Typical Workflows
-
-Recommended whole-image workflow:
-
-```bash
-python scripts/prepare_patches.py --config configs/default.yaml
-python scripts/build_patch_splits.py --config configs/default.yaml
+python scripts/build_image_splits.py --config configs/default.yaml
 python scripts/prepare_whole_images.py --config configs/default.yaml
 python scripts/train.py --config configs/default.yaml
-```
-
-Before running the last command, switch the config to:
-
-```yaml
-task:
-  mode: whole_image
-```
-
-Patch workflow remains unchanged:
-
-```bash
-python scripts/prepare_patches.py --config configs/default.yaml
-python scripts/build_patch_splits.py --config configs/default.yaml
-python scripts/train.py --config configs/default.yaml
+python scripts/test.py --config configs/default.yaml --checkpoint outputs/<project>/<run>/best_model.pth
 ```
 
 ## Install

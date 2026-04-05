@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import logging
@@ -14,7 +14,7 @@ from src.utils.io import load_yaml
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a trained classification checkpoint on the test split.")
+    parser = argparse.ArgumentParser(description="Evaluate a trained whole-image classification checkpoint on the test split.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--run-dir", type=str, default=None)
@@ -53,8 +53,8 @@ def main() -> None:
         run_dir=run_dir,
     )
     logging.info(
-        "Finished test evaluation | primary=%s acc=%.4f macro_f1=%.4f loss=%.4f",
-        metrics.get("primary_metric_level", "patch"),
+        "Finished test evaluation | sample_level=%s acc=%.4f macro_f1=%.4f loss=%.4f",
+        metrics.get("sample_level", "image"),
         metrics.get("accuracy", 0.0),
         metrics.get("macro_f1", 0.0),
         metrics.get("loss", 0.0),
@@ -63,4 +63,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

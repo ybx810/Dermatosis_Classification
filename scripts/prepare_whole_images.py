@@ -22,7 +22,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.utils.io import load_yaml
 
-Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 SUPPORTED_CACHE_FORMATS = {"png", "jpg", "jpeg"}
@@ -49,7 +48,6 @@ class WholeImageCacheConfig:
     train_csv: Path
     val_csv: Path
     test_csv: Path
-    patch_metadata_path: Path
     output_dir: Path
     metadata_path: Path
     summary_path: Path
@@ -60,6 +58,7 @@ class WholeImageCacheConfig:
     pad_value: int | float | tuple[int, ...] | tuple[float, ...]
     pad_position: str
     interpolation: str
+    max_image_pixels: int | float | str | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,11 +93,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
 def resolve_path(path_value: str | Path | None, default: str) -> Path:
     raw_path = Path(path_value or default)
     if raw_path.is_absolute():
         return raw_path
     return PROJECT_ROOT / raw_path
+
+
+def _configure_max_image_pixels(max_image_pixels: int | float | str | None) -> None:
+    if max_image_pixels in (None, "", "null"):
+        Image.MAX_IMAGE_PIXELS = None
+        return
+    Image.MAX_IMAGE_PIXELS = int(max_image_pixels)
 
 
 def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
@@ -108,32 +122,16 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
     data_cfg = config.get("data", {})
     whole_image_cfg = config.get("whole_image", {})
     cache_cfg = whole_image_cfg.get("cache", {})
-    prepare_patches_cfg = config.get("prepare_patches", {})
-    split_cfg = config.get("build_patch_splits", {})
+    split_cfg = config.get("build_image_splits", {})
 
-    raw_dir = resolve_path(
-        args.raw_dir or data_cfg.get("raw_dir") or prepare_patches_cfg.get("raw_dir"),
-        "data/raw",
-    )
-    train_csv = resolve_path(args.train_csv or whole_image_cfg.get("train_csv"), "data/splits/train_images.csv")
-    val_csv = resolve_path(args.val_csv or whole_image_cfg.get("val_csv"), "data/splits/val_images.csv")
-    test_csv = resolve_path(args.test_csv or whole_image_cfg.get("test_csv"), "data/splits/test_images.csv")
-    patch_metadata_path = resolve_path(
-        split_cfg.get("metadata_path") or prepare_patches_cfg.get("metadata_path"),
-        "data/metadata/patch_metadata.csv",
-    )
-    output_dir = resolve_path(
-        args.output_dir or cache_cfg.get("dir"),
-        "data/cache/whole_images",
-    )
-    metadata_path = resolve_path(
-        args.metadata_path or cache_cfg.get("metadata_path"),
-        "data/metadata/whole_image_metadata.csv",
-    )
-    summary_path = resolve_path(
-        args.summary_path or cache_cfg.get("summary_path"),
-        "data/metadata/whole_image_summary.json",
-    )
+    raw_dir = resolve_path(args.raw_dir or data_cfg.get("raw_dir"), "data/raw")
+    default_split_dir = split_cfg.get("output_dir") or data_cfg.get("split_dir") or "data/splits"
+    train_csv = resolve_path(args.train_csv or whole_image_cfg.get("train_csv"), f"{default_split_dir}/train_images.csv")
+    val_csv = resolve_path(args.val_csv or whole_image_cfg.get("val_csv"), f"{default_split_dir}/val_images.csv")
+    test_csv = resolve_path(args.test_csv or whole_image_cfg.get("test_csv"), f"{default_split_dir}/test_images.csv")
+    output_dir = resolve_path(args.output_dir or cache_cfg.get("dir"), "data/cache/whole_images")
+    metadata_path = resolve_path(args.metadata_path or cache_cfg.get("metadata_path"), "data/metadata/whole_image_metadata.csv")
+    summary_path = resolve_path(args.summary_path or cache_cfg.get("summary_path"), "data/metadata/whole_image_summary.json")
 
     size = int(args.size or cache_cfg.get("size") or 1024)
     image_format = str(args.format or cache_cfg.get("format") or "png").lower()
@@ -142,6 +140,7 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
     pad_value = args.pad_value if args.pad_value is not None else whole_image_cfg.get("pad_value", 0)
     pad_position = str(args.pad_position or whole_image_cfg.get("pad_position", "center")).lower()
     interpolation = str(args.interpolation or whole_image_cfg.get("interpolation", "area")).lower()
+    max_image_pixels = whole_image_cfg.get("max_image_pixels")
 
     if size <= 0:
         raise ValueError("whole_image.cache.size must be a positive integer.")
@@ -157,7 +156,6 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
         train_csv=train_csv,
         val_csv=val_csv,
         test_csv=test_csv,
-        patch_metadata_path=patch_metadata_path,
         output_dir=output_dir,
         metadata_path=metadata_path,
         summary_path=summary_path,
@@ -168,14 +166,7 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
         pad_value=pad_value,
         pad_position=pad_position,
         interpolation=interpolation,
-    )
-
-
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        max_image_pixels=max_image_pixels,
     )
 
 
@@ -187,44 +178,17 @@ def _normalize_text(value: Any) -> str:
 
 def load_source_records(config: WholeImageCacheConfig) -> list[dict[str, Any]]:
     split_frames: list[pd.DataFrame] = []
-    split_paths = [
-        ("train", config.train_csv),
-        ("val", config.val_csv),
-        ("test", config.test_csv),
-    ]
-    for split_name, csv_path in split_paths:
+    for split_name, csv_path in (("train", config.train_csv), ("val", config.val_csv), ("test", config.test_csv)):
         if not csv_path.exists():
-            logging.warning("Whole-image split CSV not found: %s", csv_path)
-            continue
+            raise FileNotFoundError(f"Whole-image split CSV not found: {csv_path}")
         frame = pd.read_csv(csv_path)
-        if "source_image" not in frame.columns:
-            raise ValueError(f"Split CSV is missing source_image column: {csv_path}")
-        if "label" not in frame.columns:
-            raise ValueError(f"Split CSV is missing label column: {csv_path}")
+        if "source_image" not in frame.columns or "label" not in frame.columns:
+            raise ValueError(f"Split CSV must contain source_image and label columns: {csv_path}")
         if "split" not in frame.columns:
             frame["split"] = split_name
         split_frames.append(frame)
 
-    if split_frames:
-        dataframe = pd.concat(split_frames, ignore_index=True)
-        logging.info(
-            "Collected whole-image cache sources from %d image-level split file(s).",
-            len(split_frames),
-        )
-    else:
-        if not config.patch_metadata_path.exists():
-            raise FileNotFoundError(
-                "No image-level split CSVs were found and patch metadata is unavailable: "
-                f"{config.patch_metadata_path}"
-            )
-        dataframe = pd.read_csv(config.patch_metadata_path)
-        if "source_image" not in dataframe.columns or "label" not in dataframe.columns:
-            raise ValueError(
-                f"Patch metadata must contain source_image and label columns: {config.patch_metadata_path}"
-            )
-        dataframe["split"] = dataframe.get("split", "unspecified")
-        logging.info("Falling back to patch metadata source list: %s", config.patch_metadata_path)
-
+    dataframe = pd.concat(split_frames, ignore_index=True)
     for column_name in ["source_image", "label", "label_idx", "patient_id", "split"]:
         if column_name not in dataframe.columns:
             dataframe[column_name] = ""
@@ -238,55 +202,11 @@ def load_source_records(config: WholeImageCacheConfig) -> list[dict[str, Any]]:
     return records
 
 
-def load_existing_metadata(metadata_path: Path) -> dict[str, dict[str, Any]]:
-    if not metadata_path.exists():
-        return {}
-
-    dataframe = pd.read_csv(metadata_path)
-    required_columns = {"source_image", "cached_image_path"}
-    missing_columns = required_columns.difference(dataframe.columns)
-    if missing_columns:
-        logging.warning(
-            "Ignoring existing whole-image metadata because required columns are missing: %s",
-            sorted(missing_columns),
-        )
-        return {}
-
-    dataframe["source_image"] = dataframe["source_image"].apply(_normalize_text)
-    dataframe["cached_image_path"] = dataframe["cached_image_path"].apply(_normalize_text)
-    if "status" in dataframe.columns:
-        dataframe["status"] = dataframe["status"].apply(_normalize_text)
-    if "target_size" in dataframe.columns:
-        dataframe["target_size"] = pd.to_numeric(dataframe["target_size"], errors="coerce")
-
-    lookup: dict[str, dict[str, Any]] = {}
-    for row in dataframe.to_dict(orient="records"):
-        source_image = _normalize_text(row.get("source_image"))
-        if not source_image:
-            continue
-        lookup[source_image] = row
-    logging.info("Loaded %d existing whole-image metadata rows from %s", len(lookup), metadata_path)
-    return lookup
-
-
-def resolve_source_path(source_image: str, raw_dir: Path) -> Path:
+def resolve_source_path(source_image: str) -> Path:
     candidate = Path(source_image)
     if candidate.is_absolute():
         return candidate.resolve()
-
-    project_relative = (PROJECT_ROOT / candidate).resolve()
-    if project_relative.exists():
-        return project_relative
-
-    try:
-        stripped_candidate = candidate.relative_to(raw_dir)
-        raw_relative = (raw_dir / stripped_candidate).resolve()
-    except ValueError:
-        raw_relative = (raw_dir / candidate).resolve()
-
-    if raw_relative.exists():
-        return raw_relative
-    return project_relative
+    return (PROJECT_ROOT / candidate).resolve()
 
 
 def _path_relative_to(path: Path, base: Path) -> Path | None:
@@ -394,9 +314,7 @@ def resize_and_pad_image(
     resized_image = cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
     canvas = np.full((target_size, target_size, 3), pad_value, dtype=np.uint8)
     top, left = compute_pad_offsets(target_size, resized_height, resized_width, pad_position, source_image)
-    bottom = top + resized_height
-    right = left + resized_width
-    canvas[top:bottom, left:right] = resized_image
+    canvas[top : top + resized_height, left : left + resized_width] = resized_image
     return canvas
 
 
@@ -442,17 +360,11 @@ def build_metadata_row(
     }
 
 
-
-def process_source_image(
-    record: dict[str, Any],
-    config: WholeImageCacheConfig,
-    existing_metadata: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
+def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) -> dict[str, Any]:
     source_image = _normalize_text(record.get("source_image"))
-    source_path = resolve_source_path(source_image, config.raw_dir)
+    source_path = resolve_source_path(source_image)
     cached_output_path = build_cached_output_path(source_image, source_path, config)
     cached_image_path = path_to_project_string(cached_output_path)
-    existing_row = existing_metadata.get(source_image)
 
     if cached_output_path.exists() and not config.overwrite:
         try:
@@ -472,14 +384,11 @@ def process_source_image(
                     ),
                 )
 
-            original_width = existing_row.get("original_width") if existing_row is not None else ""
-            original_height = existing_row.get("original_height") if existing_row is not None else ""
-            if original_width in {None, ""} or original_height in {None, ""}:
-                original_width, original_height = load_image_size(source_path)
+            original_width, original_height = load_image_size(source_path)
             return build_metadata_row(
                 record=record,
                 cached_image_path=cached_image_path,
-                original_size=(int(original_width), int(original_height)),
+                original_size=(original_width, original_height),
                 cached_size=(cached_width, cached_height),
                 target_size=config.size,
                 status="skipped_existing",
@@ -555,7 +464,6 @@ def write_summary(summary_path: Path, config: WholeImageCacheConfig, rows: list[
         "train_csv": str(config.train_csv),
         "val_csv": str(config.val_csv),
         "test_csv": str(config.test_csv),
-        "patch_metadata_path": str(config.patch_metadata_path),
         "output_dir": str(config.output_dir),
         "metadata_path": str(config.metadata_path),
         "size": int(config.size),
@@ -565,6 +473,7 @@ def write_summary(summary_path: Path, config: WholeImageCacheConfig, rows: list[
         "pad_position": config.pad_position,
         "pad_value": config.pad_value if isinstance(config.pad_value, (int, float)) else list(config.pad_value),
         "interpolation": config.interpolation,
+        "max_image_pixels": config.max_image_pixels,
         "total_source_images": len(rows),
         "status_counts": counts,
         "success_count": int(counts.get("success", 0)),
@@ -576,15 +485,12 @@ def write_summary(summary_path: Path, config: WholeImageCacheConfig, rows: list[
 
 
 def prepare_whole_images(config: WholeImageCacheConfig) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    _configure_max_image_pixels(config.max_image_pixels)
     records = load_source_records(config)
-    existing_metadata = load_existing_metadata(config.metadata_path)
     rows: list[dict[str, Any]] = []
 
     with ThreadPoolExecutor(max_workers=config.num_workers) as executor:
-        futures = [
-            executor.submit(process_source_image, record, config, existing_metadata)
-            for record in records
-        ]
+        futures = [executor.submit(process_source_image, record, config) for record in records]
         for future in tqdm(as_completed(futures), total=len(futures), desc="Preparing whole images"):
             rows.append(future.result())
 

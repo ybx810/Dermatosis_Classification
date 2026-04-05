@@ -1,10 +1,9 @@
 from importlib import import_module
 
 __all__ = [
-    "aggregate_patch_predictions_to_image",
+    "build_image_level_metrics",
     "compute_classification_metrics",
-    "compute_multilevel_classification_metrics",
-    "resolve_evaluation_config",
+    "compute_per_class_metrics",
     "save_confusion_matrix_figure",
     "save_metrics_json",
     "export_training_visualizations",
@@ -15,10 +14,9 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in {
-        "aggregate_patch_predictions_to_image",
+        "build_image_level_metrics",
         "compute_classification_metrics",
-        "compute_multilevel_classification_metrics",
-        "resolve_evaluation_config",
+        "compute_per_class_metrics",
         "save_confusion_matrix_figure",
         "save_metrics_json",
     }:
