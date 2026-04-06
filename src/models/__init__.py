@@ -1,5 +1,7 @@
 from src.models.build_model import (
+    build_feature_extractor,
     build_model,
+    extract_backbone_features,
     get_backbone_modules,
     get_backbone_parameters,
     get_classifier_module,
@@ -9,6 +11,8 @@ from src.models.build_model import (
 
 __all__ = [
     "build_model",
+    "build_feature_extractor",
+    "extract_backbone_features",
     "get_classifier_module",
     "get_classifier_parameters",
     "get_backbone_parameters",

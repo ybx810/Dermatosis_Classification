@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
+import torch
 import torch.nn as nn
 from torchvision import models
 
@@ -186,3 +189,93 @@ def build_model(config: dict[str, Any]) -> nn.Module:
         f"Unsupported model backbone: {model_name}. "
         f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
     )
+
+
+def extract_backbone_features(model: nn.Module, backbone_name: str, x: torch.Tensor) -> torch.Tensor:
+    normalized_name = _normalize_backbone_name(backbone_name)
+
+    if normalized_name in {"resnet18", "resnet50"}:
+        x = model.conv1(x)
+        x = model.bn1(x)
+        x = model.relu(x)
+        x = model.maxpool(x)
+        x = model.layer1(x)
+        x = model.layer2(x)
+        x = model.layer3(x)
+        x = model.layer4(x)
+        x = model.avgpool(x)
+        return torch.flatten(x, 1)
+
+    if normalized_name == "efficientnet_b0":
+        x = model.features(x)
+        x = model.avgpool(x)
+        return torch.flatten(x, 1)
+
+    if normalized_name == "convnext_tiny":
+        x = model.features(x)
+        x = model.avgpool(x)
+        x = model.classifier[0](x)
+        return torch.flatten(x, 1)
+
+    raise ValueError(
+        f"Unsupported model backbone for feature extraction: {normalized_name}. "
+        f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
+    )
+
+
+def _resolve_checkpoint_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint payload must be a dict-like object.")
+
+    model_state_dict = checkpoint.get("model_state_dict")
+    if isinstance(model_state_dict, dict):
+        return model_state_dict
+
+    state_dict = checkpoint.get("state_dict")
+    if isinstance(state_dict, dict):
+        return state_dict
+
+    if checkpoint and all(isinstance(key, str) for key in checkpoint.keys()) and all(
+        isinstance(value, torch.Tensor) for value in checkpoint.values()
+    ):
+        return checkpoint
+
+    raise ValueError("Checkpoint does not contain a valid model state dict.")
+
+
+def build_feature_extractor(
+    config: dict[str, Any],
+    backbone_name: str | None = None,
+    source: str = "imagenet_pretrained",
+    checkpoint_path: str | Path | None = None,
+    map_location: str | torch.device | None = "cpu",
+) -> tuple[nn.Module, str]:
+    normalized_source = str(source).lower()
+    if normalized_source not in {"imagenet_pretrained", "checkpoint"}:
+        raise ValueError(
+            f"Unsupported feature source: {normalized_source}. "
+            "Expected one of {'imagenet_pretrained', 'checkpoint'}."
+        )
+
+    mutable_config = deepcopy(config)
+    model_config = mutable_config.setdefault("model", {})
+    resolved_backbone_name = _normalize_backbone_name(
+        str(backbone_name or model_config.get("name", "resnet18")).lower()
+    )
+    model_config["name"] = resolved_backbone_name
+
+    if normalized_source == "imagenet_pretrained":
+        model_config["pretrained"] = True
+    else:
+        model_config["pretrained"] = False
+
+    model = build_model(mutable_config)
+
+    if normalized_source == "checkpoint":
+        if checkpoint_path in (None, ""):
+            raise ValueError("checkpoint_path is required when source='checkpoint'.")
+        checkpoint = torch.load(Path(checkpoint_path), map_location=map_location)
+        model_state_dict = _resolve_checkpoint_state_dict(checkpoint)
+        model.load_state_dict(model_state_dict)
+
+    return model, resolved_backbone_name

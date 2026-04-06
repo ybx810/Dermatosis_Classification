@@ -11,7 +11,7 @@ data:
   metadata_dir: data/metadata
   split_dir: data/splits
   cache_dir: data/cache
-  num_classes: 16
+  num_classes: 12
 
 build_image_splits:
   output_dir: data/splits
@@ -44,7 +44,7 @@ whole_image:
 
 train:
   batch_size: 16
-  num_workers: 4
+  num_workers: 8
   epochs: 10
   device: cuda
   mixed_precision: true
@@ -100,3 +100,56 @@ scheduler:
 
 evaluation:
   primary_metric: macro_f1
+
+ml_experiment:
+  enabled: false
+  output_dir: outputs
+  feature_dir:
+  feature_source: imagenet_pretrained
+  checkpoint_path:
+  backbone: efficientnet_b0
+  extract_batch_size:
+  use_mixed_precision: true
+  save_features: true
+  reuse_saved_features: false
+
+  preprocessing:
+    standardize: true
+    pca:
+      enabled: false
+      n_components: 0.95
+
+  model_selection:
+    primary_metric: macro_f1
+
+  classifiers:
+    selected:
+      - logistic_regression
+      - linear_svm
+      - rbf_svm
+      - random_forest
+      - knn
+
+    logistic_regression:
+      C: [0.01, 0.1, 1.0, 10.0]
+      max_iter: 3000
+      class_weight: balanced
+
+    linear_svm:
+      C: [0.01, 0.1, 1.0, 10.0]
+      class_weight: balanced
+
+    rbf_svm:
+      C: [0.1, 1.0, 10.0]
+      gamma: ["scale", 0.01, 0.001]
+      class_weight: balanced
+      probability: true
+
+    random_forest:
+      n_estimators: [200, 500]
+      max_depth: [null, 10, 20]
+      class_weight: balanced
+
+    knn:
+      n_neighbors: [3, 5, 7]
+      weights: ["uniform", "distance"]

@@ -1,4 +1,4 @@
-﻿torch
+torch
 torchvision
 albumentations
 opencv-python
@@ -9,3 +9,4 @@ PyYAML
 scikit-learn
 matplotlib
 tqdm
+joblib
