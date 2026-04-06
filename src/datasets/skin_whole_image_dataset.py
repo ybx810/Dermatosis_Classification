@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -26,6 +26,28 @@ def _configure_max_image_pixels(max_image_pixels: int | float | str | None) -> N
     Image.MAX_IMAGE_PIXELS = int(max_image_pixels)
 
 
+def _resolve_image_size(whole_image_config: dict[str, Any]) -> int:
+    image_size = int(whole_image_config.get("image_size", 512))
+    if image_size <= 0:
+        raise ValueError("whole_image.image_size must be a positive integer.")
+
+    cache_config = whole_image_config.get("cache", {})
+    deprecated_cache_size = cache_config.get("size")
+    if deprecated_cache_size not in (None, "", "null"):
+        deprecated_cache_size = int(deprecated_cache_size)
+        if deprecated_cache_size != image_size:
+            raise ValueError(
+                "whole_image.cache.size is deprecated and must match whole_image.image_size. "
+                f"Got cache.size={deprecated_cache_size} and image_size={image_size}."
+            )
+        logging.warning(
+            "whole_image.cache.size is deprecated. whole_image.image_size=%d is the single geometry size used "
+            "for cache generation and model input.",
+            image_size,
+        )
+    return image_size
+
+
 class SkinWholeImageDataset(Dataset):
     """Whole-image classification dataset backed by an image-level split CSV."""
 
@@ -48,16 +70,33 @@ class SkinWholeImageDataset(Dataset):
         self.project_root = Path(project_root) if project_root is not None else PROJECT_ROOT
         self.whole_image_config = whole_image_config or {}
         self.cache_config = self.whole_image_config.get("cache", {})
+        self.image_size = _resolve_image_size(self.whole_image_config)
+        self.cache_enabled = bool(self.cache_config.get("enabled", False))
+        self.use_cached_images = self.cache_enabled and bool(self.cache_config.get("use_cached_for_training", True))
+        self.allow_raw_fallback = bool(self.cache_config.get("allow_raw_fallback", False))
+        self.require_cached_images = self.use_cached_images and not self.allow_raw_fallback
+
         _configure_max_image_pixels(self.whole_image_config.get("max_image_pixels"))
 
         self.samples = self._load_samples(self.csv_file)
         self.label_mapping = self._build_label_mapping(label_mapping, label_mapping_path)
         self.cached_image_mapping = self._load_cached_image_mapping()
         self._missing_cached_paths: set[str] = set()
+        self._raw_fallback_warnings: set[str] = set()
         self.transform = transform or build_whole_image_transforms(
             self.mode,
             transform_cfg=transform_config,
             whole_image_config=self.whole_image_config,
+        )
+
+        logging.info(
+            "Whole-image dataset | mode=%s samples=%d image_size=%d cache_enabled=%s use_cached_for_training=%s allow_raw_fallback=%s",
+            self.mode,
+            len(self.samples),
+            self.image_size,
+            self.cache_enabled,
+            self.use_cached_images,
+            self.allow_raw_fallback,
         )
 
     def __len__(self) -> int:
@@ -71,6 +110,7 @@ class SkinWholeImageDataset(Dataset):
         try:
             with Image.open(image_path) as image:
                 image = image.convert("RGB")
+                width, height = image.size
                 image = np.array(image)
         except FileNotFoundError as exc:
             raise FileNotFoundError(
@@ -87,6 +127,13 @@ class SkinWholeImageDataset(Dataset):
                 f"Failed to open {image_kind}: {image_path} "
                 f"(csv: {self.csv_file}, index: {index})"
             ) from exc
+
+        if height != self.image_size or width != self.image_size:
+            raise RuntimeError(
+                f"Whole-image input must already be preprocessed to {self.image_size}x{self.image_size}, but got "
+                f"{width}x{height} from {image_kind}: {image_path}. Run scripts/prepare_whole_images.py with "
+                "the current whole_image.image_size before training, validation, or testing."
+            )
 
         if self.transform is not None:
             image = self.transform(image=image)["image"]
@@ -144,38 +191,36 @@ class SkinWholeImageDataset(Dataset):
         labels = sorted(self.samples["label"].unique().tolist())
         return {label: idx for idx, label in enumerate(labels)}
 
-    def _should_use_cached_images(self) -> bool:
-        cache_enabled = bool(self.cache_config.get("enabled", False))
-        cache_flag = self.cache_config.get("use_cached_images")
-        if cache_flag is None:
-            cache_flag = self.cache_config.get("use_cached_for_training", True)
-        return cache_enabled and bool(cache_flag)
-
     def _load_cached_image_mapping(self) -> dict[str, str]:
-        if not self._should_use_cached_images():
+        if not self.use_cached_images:
             return {}
 
         metadata_path_value = self.cache_config.get("metadata_path")
         if not metadata_path_value:
-            logging.warning("Whole-image cache is enabled but whole_image.cache.metadata_path is not configured.")
+            message = "Whole-image cache is enabled but whole_image.cache.metadata_path is not configured."
+            if self.require_cached_images:
+                raise FileNotFoundError(message)
+            logging.warning("%s Falling back to raw source images.", message)
             return {}
 
         metadata_path = self._resolve_project_path(metadata_path_value)
         if not metadata_path.exists():
-            logging.warning(
-                "Whole-image cache metadata not found at %s. Falling back to raw source_image reads.",
-                metadata_path,
-            )
+            message = f"Whole-image cache metadata not found: {metadata_path}"
+            if self.require_cached_images:
+                raise FileNotFoundError(message)
+            logging.warning("%s Falling back to raw source images.", message)
             return {}
 
         metadata = pd.read_csv(metadata_path)
         required_columns = {"source_image", "cached_image_path"}
         missing_columns = required_columns.difference(metadata.columns)
         if missing_columns:
-            logging.warning(
-                "Whole-image cache metadata is missing required columns %s. Falling back to raw source_image reads.",
-                sorted(missing_columns),
+            message = (
+                f"Whole-image cache metadata is missing required columns {sorted(missing_columns)}: {metadata_path}"
             )
+            if self.require_cached_images:
+                raise ValueError(message)
+            logging.warning("%s Falling back to raw source images.", message)
             return {}
 
         metadata["source_image"] = metadata["source_image"].fillna("").astype(str).str.strip()
@@ -184,6 +229,9 @@ class SkinWholeImageDataset(Dataset):
             metadata["status"] = metadata["status"].fillna("").astype(str).str.strip().str.lower()
             metadata = metadata[metadata["status"].isin(SUCCESS_CACHE_STATUSES)]
         metadata = metadata[metadata["cached_image_path"].str.len() > 0]
+
+        if self.require_cached_images:
+            self._validate_cached_metadata(metadata, metadata_path)
 
         mapping: dict[str, str] = {}
         for row in metadata.itertuples(index=False):
@@ -197,6 +245,67 @@ class SkinWholeImageDataset(Dataset):
         logging.info("Loaded %d cached whole-image paths from %s", len(mapping), metadata_path)
         return mapping
 
+    def _validate_cached_metadata(self, metadata: pd.DataFrame, metadata_path: Path) -> None:
+        if metadata.empty and len(self.samples) > 0:
+            raise RuntimeError(
+                f"Whole-image cache metadata has no usable cached entries: {metadata_path}. "
+                "Run scripts/prepare_whole_images.py before training."
+            )
+
+        metadata_by_source = metadata.drop_duplicates(subset="source_image", keep="first").set_index("source_image")
+        missing_mappings: list[str] = []
+        missing_files: list[str] = []
+        wrong_sizes: list[str] = []
+
+        for source_image in self.samples["source_image"].astype(str).tolist():
+            if source_image not in metadata_by_source.index:
+                missing_mappings.append(source_image)
+                continue
+
+            row = metadata_by_source.loc[source_image]
+            cached_image_path = str(row.get("cached_image_path", "")).strip()
+            if not cached_image_path:
+                missing_mappings.append(source_image)
+                continue
+
+            cached_path = self._resolve_image_path(cached_image_path)
+            if not cached_path.exists():
+                missing_files.append(str(cached_path))
+
+            cached_width = row.get("cached_width")
+            cached_height = row.get("cached_height")
+            target_size = row.get("target_size")
+            if pd.notna(cached_width) and pd.notna(cached_height):
+                if int(cached_width) != self.image_size or int(cached_height) != self.image_size:
+                    wrong_sizes.append(f"{source_image} -> {int(cached_width)}x{int(cached_height)}")
+                    continue
+            if pd.notna(target_size) and int(target_size) != self.image_size:
+                wrong_sizes.append(f"{source_image} -> target_size={int(target_size)}")
+
+        error_lines: list[str] = []
+        if missing_mappings:
+            preview = ", ".join(missing_mappings[:3])
+            error_lines.append(
+                f"missing cached_image_path for {len(missing_mappings)} source_image entries (examples: {preview})"
+            )
+        if missing_files:
+            preview = ", ".join(missing_files[:3])
+            error_lines.append(
+                f"missing cached files for {len(missing_files)} metadata rows (examples: {preview})"
+            )
+        if wrong_sizes:
+            preview = ", ".join(wrong_sizes[:3])
+            error_lines.append(
+                f"cached files with unexpected size for {len(wrong_sizes)} source_image entries (examples: {preview})"
+            )
+
+        if error_lines:
+            raise RuntimeError(
+                "Whole-image cache validation failed while allow_raw_fallback=false. "
+                + " | ".join(error_lines)
+                + ". Re-run scripts/prepare_whole_images.py with the current whole_image.image_size."
+            )
+
     def _resolve_preferred_image_path(self, source_image: str) -> tuple[Path, bool]:
         raw_path = self._resolve_image_path(source_image)
         cached_image_value = self.cached_image_mapping.get(source_image) or self.cached_image_mapping.get(str(raw_path))
@@ -204,6 +313,12 @@ class SkinWholeImageDataset(Dataset):
             cached_path = self._resolve_image_path(cached_image_value)
             if cached_path.exists():
                 return cached_path, True
+
+            if self.require_cached_images:
+                raise FileNotFoundError(
+                    f"Cached whole-image file is missing for source_image={source_image}: {cached_path}. "
+                    "Run scripts/prepare_whole_images.py before training."
+                )
 
             cache_key = str(cached_path)
             if cache_key not in self._missing_cached_paths:
@@ -213,7 +328,24 @@ class SkinWholeImageDataset(Dataset):
                     raw_path,
                 )
                 self._missing_cached_paths.add(cache_key)
+            return raw_path, False
 
+        if self.require_cached_images:
+            raise FileNotFoundError(
+                f"No cached whole-image path found for source_image={source_image} in whole_image.cache.metadata_path. "
+                "Run scripts/prepare_whole_images.py before training."
+            )
+
+        if self.use_cached_images:
+            warning_key = str(raw_path)
+            if warning_key not in self._raw_fallback_warnings:
+                logging.warning(
+                    "No cached whole-image path found for source_image=%s. Falling back to raw source image %s because "
+                    "whole_image.cache.allow_raw_fallback=true.",
+                    source_image,
+                    raw_path,
+                )
+                self._raw_fallback_warnings.add(warning_key)
         return raw_path, False
 
     def _resolve_project_path(self, path_value: str | Path) -> Path:

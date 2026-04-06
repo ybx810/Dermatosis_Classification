@@ -1,13 +1,13 @@
-# Large Medical Whole-Image Classification
+﻿# Large Medical Whole-Image Classification
 
 This repository is a pure whole-image classification project.
 
 The training, validation, and test sample unit is always one `source_image`.
-The recommended data path is:
+The whole-image workflow is now a single offline geometry preprocessing path:
 
 1. build image-level splits from raw whole images
-2. prepare cached low-resolution whole-image copies offline
-3. train a single-branch classifier on cached whole images
+2. run `scripts/prepare_whole_images.py` to convert raw whole images into fixed-size square cached images
+3. train a single-branch classifier directly on those cached whole images
 4. evaluate checkpoints with image-level metrics and per-class metrics
 
 ## Project Layout
@@ -49,7 +49,7 @@ Each row corresponds to one `source_image`. The split builder keeps train/val/te
 
 ## 2. Prepare Cached Whole Images
 
-Prepare cached low-resolution whole-image copies before training:
+Prepare fixed-size cached whole-image copies before training:
 
 ```bash
 python scripts/prepare_whole_images.py --config configs/default.yaml
@@ -57,20 +57,21 @@ python scripts/prepare_whole_images.py --config configs/default.yaml
 
 Outputs:
 
-- cached whole-image files under `data/cache/whole_images/size_<cache_size>/...`
+- cached whole-image files under `data/cache/whole_images/size_<image_size>/...`
 - `data/metadata/whole_image_metadata.csv`
 - `data/metadata/whole_image_summary.json`
 
-Each cached whole image preserves aspect ratio, is resized to fit within `whole_image.cache.size`, and is padded to a fixed square canvas.
+Behavior:
+
+- raw whole images are converted to RGB
+- the long side is scaled to `whole_image.image_size`
+- the shorter side is padded to a square canvas using `whole_image.pad_position` and `whole_image.pad_value`
+- the saved cached image size is always exactly `whole_image.image_size x whole_image.image_size`
+- `whole_image.interpolation` controls the offline downsampling interpolation and supports `area` and `bilinear`
+
+This offline script is the only place where whole-image resize and padding happen.
 
 ## 3. Train
-
-The default config already targets whole-image training:
-
-```yaml
-task:
-  mode: whole_image
-```
 
 Run training with:
 
@@ -81,8 +82,11 @@ python scripts/train.py --config configs/default.yaml
 Behavior:
 
 - one sample equals one `source_image`
-- the dataset prefers `cached_image_path` from `whole_image_metadata.csv`
-- if a cached file is missing, the dataset can fall back to the raw source image
+- the dataset reads `cached_image_path` from `whole_image_metadata.csv`
+- training, validation, and testing do not repeat resize and padding in the dataloader
+- transforms only apply flip augmentation on train, then normalize and convert to tensor
+- when `whole_image.cache.enabled=true` and `whole_image.cache.use_cached_for_training=true`, cached images are required by default
+- if a cached entry is missing and `whole_image.cache.allow_raw_fallback=false`, the dataset raises a clear error and stops
 - the model is a single-input single-output backbone classifier
 - validation uses direct image-level metrics
 - best model selection defaults to validation `macro_f1`
@@ -128,15 +132,15 @@ whole_image:
     dir: data/cache/whole_images
     metadata_path: data/metadata/whole_image_metadata.csv
     summary_path: data/metadata/whole_image_summary.json
-    size: 1024
     format: png
     overwrite: false
     num_workers: 4
     use_cached_for_training: true
+    allow_raw_fallback: false
 ```
 
-`image_size` is the final model input size.
-`whole_image.cache.size` is the offline cached whole-image size.
+`whole_image.image_size` is the single source of truth for both offline cached image size and model input size.
+If an older config still contains `whole_image.cache.size`, it is treated as deprecated and must match `whole_image.image_size`.
 
 ## 6. Standard Workflow
 

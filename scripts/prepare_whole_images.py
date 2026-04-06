@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import hashlib
@@ -25,6 +25,7 @@ from src.utils.io import load_yaml
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 SUPPORTED_CACHE_FORMATS = {"png", "jpg", "jpeg"}
+SUPPORTED_INTERPOLATIONS = {"area", "bilinear"}
 METADATA_COLUMNS = [
     "source_image",
     "cached_image_path",
@@ -51,7 +52,7 @@ class WholeImageCacheConfig:
     output_dir: Path
     metadata_path: Path
     summary_path: Path
-    size: int
+    image_size: int
     image_format: str
     overwrite: bool
     num_workers: int
@@ -73,7 +74,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--metadata-path", type=str, default=None)
     parser.add_argument("--summary-path", type=str, default=None)
-    parser.add_argument("--size", type=int, default=None)
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=None,
+        help="Deprecated alias for whole_image.image_size. If provided, it must match whole_image.image_size.",
+    )
     parser.add_argument("--format", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--pad-value", type=float, default=None)
@@ -84,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--interpolation",
-        choices=["nearest", "bilinear", "bicubic", "area", "lanczos"],
+        choices=sorted(SUPPORTED_INTERPOLATIONS),
         default=None,
     )
     parser.add_argument("--overwrite", dest="overwrite", action="store_true")
@@ -115,6 +121,33 @@ def _configure_max_image_pixels(max_image_pixels: int | float | str | None) -> N
     Image.MAX_IMAGE_PIXELS = int(max_image_pixels)
 
 
+def _resolve_image_size(args: argparse.Namespace, whole_image_cfg: dict[str, Any], cache_cfg: dict[str, Any]) -> int:
+    image_size = int(whole_image_cfg.get("image_size", 1024))
+    if image_size <= 0:
+        raise ValueError("whole_image.image_size must be a positive integer.")
+
+    if args.size is not None and int(args.size) != image_size:
+        raise ValueError(
+            "--size is deprecated and must match whole_image.image_size. "
+            f"Got --size={int(args.size)} and whole_image.image_size={image_size}."
+        )
+
+    deprecated_cache_size = cache_cfg.get("size")
+    if deprecated_cache_size not in (None, "", "null"):
+        deprecated_cache_size = int(deprecated_cache_size)
+        if deprecated_cache_size != image_size:
+            raise ValueError(
+                "whole_image.cache.size is deprecated and must match whole_image.image_size. "
+                f"Got cache.size={deprecated_cache_size} and image_size={image_size}."
+            )
+        logging.warning(
+            "whole_image.cache.size is deprecated. Using whole_image.image_size=%d as the only geometry size.",
+            image_size,
+        )
+
+    return image_size
+
+
 def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
     config_path = resolve_path(args.config, "configs/default.yaml")
     config = load_yaml(config_path) if config_path.exists() else {}
@@ -133,7 +166,7 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
     metadata_path = resolve_path(args.metadata_path or cache_cfg.get("metadata_path"), "data/metadata/whole_image_metadata.csv")
     summary_path = resolve_path(args.summary_path or cache_cfg.get("summary_path"), "data/metadata/whole_image_summary.json")
 
-    size = int(args.size or cache_cfg.get("size") or 1024)
+    image_size = _resolve_image_size(args, whole_image_cfg, cache_cfg)
     image_format = str(args.format or cache_cfg.get("format") or "png").lower()
     overwrite = args.overwrite if args.overwrite is not None else bool(cache_cfg.get("overwrite", False))
     num_workers = int(args.num_workers or cache_cfg.get("num_workers") or 4)
@@ -142,13 +175,15 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
     interpolation = str(args.interpolation or whole_image_cfg.get("interpolation", "area")).lower()
     max_image_pixels = whole_image_cfg.get("max_image_pixels")
 
-    if size <= 0:
-        raise ValueError("whole_image.cache.size must be a positive integer.")
     if num_workers <= 0:
         raise ValueError("whole_image.cache.num_workers must be a positive integer.")
     if image_format not in SUPPORTED_CACHE_FORMATS:
         raise ValueError(
             f"Unsupported whole_image.cache.format: {image_format}. Expected one of {sorted(SUPPORTED_CACHE_FORMATS)}."
+        )
+    if interpolation not in SUPPORTED_INTERPOLATIONS:
+        raise ValueError(
+            f"Unsupported whole_image.interpolation: {interpolation}. Expected one of {sorted(SUPPORTED_INTERPOLATIONS)}."
         )
 
     return WholeImageCacheConfig(
@@ -159,7 +194,7 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
         output_dir=output_dir,
         metadata_path=metadata_path,
         summary_path=summary_path,
-        size=size,
+        image_size=image_size,
         image_format=image_format,
         overwrite=overwrite,
         num_workers=num_workers,
@@ -221,7 +256,7 @@ def build_cached_output_path(source_image: str, source_path: Path, config: Whole
     if relative_source is None:
         digest = hashlib.sha1(source_image.encode("utf-8")).hexdigest()[:12]
         relative_source = Path("external") / f"{source_path.stem}_{digest}{source_path.suffix}"
-    size_dir = f"size_{config.size}"
+    size_dir = f"size_{config.image_size}"
     return (config.output_dir / size_dir / relative_source).with_suffix(f".{config.image_format}")
 
 
@@ -232,11 +267,8 @@ def path_to_project_string(path: Path) -> str:
 
 def _resolve_interpolation(interpolation: str) -> int:
     interpolation_map = {
-        "nearest": cv2.INTER_NEAREST,
-        "bilinear": cv2.INTER_LINEAR,
-        "bicubic": cv2.INTER_CUBIC,
         "area": cv2.INTER_AREA,
-        "lanczos": cv2.INTER_LANCZOS4,
+        "bilinear": cv2.INTER_LINEAR,
     }
     interpolation_name = interpolation.lower()
     if interpolation_name not in interpolation_map:
@@ -369,17 +401,17 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
     if cached_output_path.exists() and not config.overwrite:
         try:
             cached_width, cached_height = load_image_size(cached_output_path)
-            if cached_width != config.size or cached_height != config.size:
+            if cached_width != config.image_size or cached_height != config.image_size:
                 return build_metadata_row(
                     record=record,
                     cached_image_path=cached_image_path,
                     original_size=None,
                     cached_size=(cached_width, cached_height),
-                    target_size=config.size,
+                    target_size=config.image_size,
                     status="error",
                     error=(
                         "Existing cached whole-image has unexpected size "
-                        f"{cached_width}x{cached_height}; expected {config.size}x{config.size}. "
+                        f"{cached_width}x{cached_height}; expected {config.image_size}x{config.image_size}. "
                         "Re-run with --overwrite to rebuild it."
                     ),
                 )
@@ -390,7 +422,7 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
                 cached_image_path=cached_image_path,
                 original_size=(original_width, original_height),
                 cached_size=(cached_width, cached_height),
-                target_size=config.size,
+                target_size=config.image_size,
                 status="skipped_existing",
             )
         except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
@@ -399,7 +431,7 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
                 cached_image_path=cached_image_path,
                 original_size=None,
                 cached_size=None,
-                target_size=config.size,
+                target_size=config.image_size,
                 status="error",
                 error=str(exc),
             )
@@ -413,7 +445,7 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
         cached_array = resize_and_pad_image(
             image=image_array,
             source_image=source_image,
-            target_size=config.size,
+            target_size=config.image_size,
             interpolation=_resolve_interpolation(config.interpolation),
             pad_value=_resolve_pad_value(config.pad_value),
             pad_position=config.pad_position,
@@ -425,7 +457,7 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
             cached_image_path=cached_image_path,
             original_size=(original_width, original_height),
             cached_size=(cached_width, cached_height),
-            target_size=config.size,
+            target_size=config.image_size,
             status="success",
         )
     except FileNotFoundError as exc:
@@ -434,7 +466,7 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
             cached_image_path=cached_image_path,
             original_size=None,
             cached_size=None,
-            target_size=config.size,
+            target_size=config.image_size,
             status="error",
             error=f"File not found: {exc}",
         )
@@ -444,7 +476,7 @@ def process_source_image(record: dict[str, Any], config: WholeImageCacheConfig) 
             cached_image_path=cached_image_path,
             original_size=None,
             cached_size=None,
-            target_size=config.size,
+            target_size=config.image_size,
             status="error",
             error=str(exc),
         )
@@ -466,7 +498,7 @@ def write_summary(summary_path: Path, config: WholeImageCacheConfig, rows: list[
         "test_csv": str(config.test_csv),
         "output_dir": str(config.output_dir),
         "metadata_path": str(config.metadata_path),
-        "size": int(config.size),
+        "image_size": int(config.image_size),
         "format": config.image_format,
         "overwrite": bool(config.overwrite),
         "num_workers": int(config.num_workers),
@@ -511,8 +543,8 @@ def main() -> None:
     setup_logging()
     config = build_config(args)
     logging.info(
-        "Whole-image cache config | size=%d format=%s interpolation=%s pad_position=%s overwrite=%s workers=%d",
-        config.size,
+        "Whole-image cache config | image_size=%d format=%s interpolation=%s pad_position=%s overwrite=%s workers=%d",
+        config.image_size,
         config.image_format,
         config.interpolation,
         config.pad_position,

@@ -1,4 +1,4 @@
-project:
+﻿project:
   name: large-medical-image-whole-image-classification-convnext-tiny
   task: whole-image-classification
   output_dir: outputs
@@ -7,7 +7,7 @@ task:
   mode: whole_image
 
 data:
-  raw_dir: G:\18disease_full
+  raw_dir: G:/18disease_full
   metadata_dir: data/metadata
   split_dir: data/splits
   cache_dir: data/cache
@@ -36,11 +36,11 @@ whole_image:
     dir: data/cache/whole_images
     metadata_path: data/metadata/whole_image_metadata.csv
     summary_path: data/metadata/whole_image_summary.json
-    size: 1024
     format: png
     overwrite: false
     num_workers: 4
     use_cached_for_training: true
+    allow_raw_fallback: false
 
 train:
   batch_size: 16

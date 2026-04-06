@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -229,9 +229,19 @@ def run_test_from_checkpoint(
     )
     criterion = build_loss(config, class_counts=class_counts, device=device)
 
+    whole_image_config = config.get("whole_image", {})
+    cache_config = whole_image_config.get("cache", {})
     logging.info("Testing checkpoint: %s", checkpoint_path)
     logging.info("Task mode: whole_image")
     logging.info("Test images: %s", len(test_loader.dataset))
+    logging.info(
+        "Whole-image config | image_size=%s interpolation=%s cache_enabled=%s use_cached_for_training=%s allow_raw_fallback=%s",
+        whole_image_config.get("image_size", 512),
+        whole_image_config.get("interpolation", "area"),
+        bool(cache_config.get("enabled", False)),
+        bool(cache_config.get("use_cached_for_training", True)),
+        bool(cache_config.get("allow_raw_fallback", False)),
+    )
 
     return test_model(
         model=model,

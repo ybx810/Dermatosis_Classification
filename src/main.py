@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -236,11 +236,21 @@ def run_training(config: dict[str, Any]) -> Path:
 
     device = select_device(config)
     use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
+    whole_image_config = config.get("whole_image", {})
+    cache_config = whole_image_config.get("cache", {})
     logging.info("Run directory: %s", run_dir)
     logging.info("Device: %s", device)
     logging.info("AMP enabled: %s", use_amp)
     logging.info("Task mode: %s", SUPPORTED_TASK_MODE)
     logging.info("Primary validation metric: %s", primary_metric)
+    logging.info(
+        "Whole-image config | image_size=%s interpolation=%s cache_enabled=%s use_cached_for_training=%s allow_raw_fallback=%s",
+        whole_image_config.get("image_size", 512),
+        whole_image_config.get("interpolation", "area"),
+        bool(cache_config.get("enabled", False)),
+        bool(cache_config.get("use_cached_for_training", True)),
+        bool(cache_config.get("allow_raw_fallback", False)),
+    )
 
     train_csv, val_csv, label_mapping_path = _resolve_split_csvs(config)
     label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
