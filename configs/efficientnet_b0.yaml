@@ -1,4 +1,4 @@
-﻿project:
+project:
   name: large-medical-image-whole-image-classification-efficientnet-b0
   task: whole-image-classification
   output_dir: outputs
@@ -76,6 +76,19 @@ optimizer:
   name: adam
   lr: 0.0003
   weight_decay: 0.0001
+  backbone_lr: 0.00003
+  classifier_lr: 0.0003
+  backbone_weight_decay:
+  classifier_weight_decay:
+  differential_lr: true
+
+finetune:
+  enabled: true
+  freeze_backbone_epochs: 3
+  unfreeze_strategy: all
+  reinit_optimizer_on_unfreeze: true
+  reset_scheduler_on_unfreeze: true
+  train_bn_when_frozen: false
 
 scheduler:
   name: none

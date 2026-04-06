@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -20,7 +20,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.datasets import build_whole_image_dataloader
 from src.engine import train_one_epoch, validate
 from src.losses import build_loss
-from src.models import build_model
+from src.models import (
+    build_model,
+    get_backbone_modules,
+    get_backbone_parameters,
+    get_classifier_module,
+    get_classifier_parameters,
+    set_backbone_trainable,
+)
 from src.utils.io import load_yaml
 from src.utils.seed import seed_everything
 from src.utils.visualize import export_training_visualizations
@@ -79,26 +86,122 @@ def select_device(config: dict[str, Any]) -> torch.device:
     return torch.device("cpu")
 
 
-def build_optimizer(config: dict[str, Any], model: torch.nn.Module) -> torch.optim.Optimizer:
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return float(value)
+
+
+def _resolve_optimizer_options(config: dict[str, Any]) -> dict[str, float | str | bool]:
     optimizer_config = config.get("optimizer", {})
     name = str(optimizer_config.get("name", "adam")).lower()
     lr = float(optimizer_config.get("lr", 3e-4))
     weight_decay = float(optimizer_config.get("weight_decay", 0.0))
+    differential_lr = bool(optimizer_config.get("differential_lr", False))
+
+    classifier_lr = _to_optional_float(optimizer_config.get("classifier_lr"))
+    if classifier_lr is None:
+        classifier_lr = lr
+
+    backbone_lr = _to_optional_float(optimizer_config.get("backbone_lr"))
+    if backbone_lr is None:
+        backbone_lr = lr * 0.1
+
+    backbone_weight_decay = _to_optional_float(optimizer_config.get("backbone_weight_decay"))
+    if backbone_weight_decay is None:
+        backbone_weight_decay = weight_decay
+
+    classifier_weight_decay = _to_optional_float(optimizer_config.get("classifier_weight_decay"))
+    if classifier_weight_decay is None:
+        classifier_weight_decay = weight_decay
+
+    momentum = float(optimizer_config.get("momentum", 0.9))
+
+    return {
+        "name": name,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "differential_lr": differential_lr,
+        "backbone_lr": backbone_lr,
+        "classifier_lr": classifier_lr,
+        "backbone_weight_decay": backbone_weight_decay,
+        "classifier_weight_decay": classifier_weight_decay,
+        "momentum": momentum,
+    }
+
+
+def _build_optimizer_with_param_groups(
+    optimizer_options: dict[str, float | str | bool],
+    param_groups: list[dict[str, Any]],
+) -> torch.optim.Optimizer:
+    name = str(optimizer_options["name"])
+    momentum = float(optimizer_options["momentum"])
 
     if name == "adam":
-        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(param_groups)
     if name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups)
     if name == "sgd":
-        momentum = float(optimizer_config.get("momentum", 0.9))
-        return torch.optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
+        return torch.optim.SGD(param_groups, momentum=momentum)
 
     raise ValueError(f"Unsupported optimizer: {name}")
+
+
+def build_optimizer(
+    config: dict[str, Any],
+    model: torch.nn.Module,
+    backbone_name: str,
+    backbone_trainable: bool,
+) -> torch.optim.Optimizer:
+    optimizer_options = _resolve_optimizer_options(config)
+    differential_lr = bool(optimizer_options["differential_lr"])
+
+    if not backbone_trainable:
+        classifier_parameters = get_classifier_parameters(model, backbone_name)
+        head_lr = float(optimizer_options["classifier_lr"]) if differential_lr else float(optimizer_options["lr"])
+        head_weight_decay = (
+            float(optimizer_options["classifier_weight_decay"])
+            if differential_lr
+            else float(optimizer_options["weight_decay"])
+        )
+        param_groups = [
+            {
+                "params": classifier_parameters,
+                "lr": head_lr,
+                "weight_decay": head_weight_decay,
+                "group_name": "classifier",
+            }
+        ]
+        return _build_optimizer_with_param_groups(optimizer_options, param_groups)
+
+    if differential_lr:
+        param_groups = [
+            {
+                "params": get_backbone_parameters(model, backbone_name),
+                "lr": float(optimizer_options["backbone_lr"]),
+                "weight_decay": float(optimizer_options["backbone_weight_decay"]),
+                "group_name": "backbone",
+            },
+            {
+                "params": get_classifier_parameters(model, backbone_name),
+                "lr": float(optimizer_options["classifier_lr"]),
+                "weight_decay": float(optimizer_options["classifier_weight_decay"]),
+                "group_name": "classifier",
+            },
+        ]
+    else:
+        param_groups = [
+            {
+                "params": list(model.parameters()),
+                "lr": float(optimizer_options["lr"]),
+                "weight_decay": float(optimizer_options["weight_decay"]),
+                "group_name": "all",
+            }
+        ]
+
+    return _build_optimizer_with_param_groups(optimizer_options, param_groups)
 
 
 def build_scheduler(
@@ -124,6 +227,130 @@ def build_scheduler(
         return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=factor, patience=patience)
 
     raise ValueError(f"Unsupported scheduler: {name}")
+
+
+def _rebuild_scheduler_with_previous_state(
+    config: dict[str, Any],
+    previous_scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+    optimizer: torch.optim.Optimizer,
+    num_epochs: int,
+) -> torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None:
+    if previous_scheduler is None:
+        return None
+
+    rebuilt_scheduler = build_scheduler(config, optimizer, num_epochs)
+    if rebuilt_scheduler is None:
+        return None
+
+    try:
+        rebuilt_scheduler.load_state_dict(previous_scheduler.state_dict())
+    except Exception as error:  # pragma: no cover - defensive branch for scheduler internals.
+        logging.warning(
+            "Failed to restore scheduler state after optimizer rebuild: %s. Using a fresh scheduler instead.",
+            error,
+        )
+
+    return rebuilt_scheduler
+
+
+def _collect_optimizer_param_ids(optimizer: torch.optim.Optimizer) -> set[int]:
+    parameter_ids: set[int] = set()
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            parameter_ids.add(id(parameter))
+    return parameter_ids
+
+
+def _add_backbone_group_to_optimizer(
+    config: dict[str, Any],
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    backbone_name: str,
+) -> None:
+    optimizer_options = _resolve_optimizer_options(config)
+    differential_lr = bool(optimizer_options["differential_lr"])
+    existing_parameter_ids = _collect_optimizer_param_ids(optimizer)
+    backbone_parameters = [
+        parameter
+        for parameter in get_backbone_parameters(model, backbone_name)
+        if id(parameter) not in existing_parameter_ids
+    ]
+    if not backbone_parameters:
+        return
+
+    backbone_lr = float(optimizer_options["backbone_lr"]) if differential_lr else float(optimizer_options["lr"])
+    backbone_weight_decay = (
+        float(optimizer_options["backbone_weight_decay"])
+        if differential_lr
+        else float(optimizer_options["weight_decay"])
+    )
+    optimizer.add_param_group(
+        {
+            "params": backbone_parameters,
+            "lr": backbone_lr,
+            "weight_decay": backbone_weight_decay,
+            "group_name": "backbone",
+        }
+    )
+
+
+def _resolve_finetune_config(config: dict[str, Any]) -> dict[str, Any]:
+    finetune_config = config.get("finetune", {}) or {}
+    freeze_backbone_epochs = int(finetune_config.get("freeze_backbone_epochs", 0))
+    if freeze_backbone_epochs < 0:
+        raise ValueError("finetune.freeze_backbone_epochs must be >= 0")
+
+    unfreeze_strategy = str(finetune_config.get("unfreeze_strategy", "all")).lower()
+    if unfreeze_strategy != "all":
+        raise ValueError("Only finetune.unfreeze_strategy=all is supported in current training pipeline.")
+
+    return {
+        "enabled": bool(finetune_config.get("enabled", False)),
+        "freeze_backbone_epochs": freeze_backbone_epochs,
+        "unfreeze_strategy": unfreeze_strategy,
+        "reinit_optimizer_on_unfreeze": bool(finetune_config.get("reinit_optimizer_on_unfreeze", True)),
+        "reset_scheduler_on_unfreeze": bool(finetune_config.get("reset_scheduler_on_unfreeze", True)),
+        "train_bn_when_frozen": bool(finetune_config.get("train_bn_when_frozen", False)),
+    }
+
+
+def configure_model_train_mode(
+    model: torch.nn.Module,
+    backbone_name: str,
+    backbone_trainable: bool,
+    train_bn_when_frozen: bool,
+) -> None:
+    model.train()
+    get_classifier_module(model, backbone_name).train()
+
+    for backbone_module in get_backbone_modules(model, backbone_name):
+        if backbone_trainable or train_bn_when_frozen:
+            backbone_module.train()
+        else:
+            backbone_module.eval()
+
+
+def _find_param_group_lr(optimizer: torch.optim.Optimizer, group_name: str) -> float | None:
+    for param_group in optimizer.param_groups:
+        if param_group.get("group_name") == group_name:
+            return float(param_group["lr"])
+    return None
+
+
+def _resolve_stage_learning_rates(
+    optimizer: torch.optim.Optimizer,
+    backbone_trainable: bool,
+) -> tuple[float | None, float]:
+    default_lr = float(optimizer.param_groups[0]["lr"])
+    classifier_lr = _find_param_group_lr(optimizer, "classifier")
+    if classifier_lr is None:
+        classifier_lr = default_lr
+
+    backbone_lr = _find_param_group_lr(optimizer, "backbone")
+    if backbone_lr is None:
+        backbone_lr = default_lr if backbone_trainable else None
+
+    return backbone_lr, classifier_lr
 
 
 def _validate_task_mode(config: dict[str, Any]) -> None:
@@ -272,17 +499,54 @@ def run_training(config: dict[str, Any]) -> Path:
         shuffle=False,
     )
 
+    num_epochs = int(config.get("train", {}).get("epochs", 20))
+    backbone_name = str(config.get("model", {}).get("name", "resnet18")).lower()
+    finetune_config = _resolve_finetune_config(config)
+    optimizer_options = _resolve_optimizer_options(config)
+    use_frozen_head_stage = bool(finetune_config["enabled"]) and int(finetune_config["freeze_backbone_epochs"]) > 0
+    backbone_trainable = not use_frozen_head_stage
+    backbone_unfrozen = not use_frozen_head_stage
+
     model = build_model(config).to(device)
-    optimizer = build_optimizer(config, model)
-    scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
+    set_backbone_trainable(
+        model,
+        backbone_name,
+        trainable=backbone_trainable,
+        train_bn_when_frozen=bool(finetune_config["train_bn_when_frozen"]),
+    )
+
+    optimizer = build_optimizer(
+        config=config,
+        model=model,
+        backbone_name=backbone_name,
+        backbone_trainable=backbone_trainable,
+    )
+    scheduler = build_scheduler(config, optimizer, num_epochs=num_epochs)
     class_counts = compute_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
     criterion = build_loss(config, class_counts=class_counts, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     whole_image_config = config.get("whole_image", {})
     cache_config = whole_image_config.get("cache", {})
-    logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
+    logging.info("Model: %s", backbone_name)
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
+    logging.info(
+        "Optimizer config | name=%s differential_lr=%s lr=%.6f backbone_lr=%.6f classifier_lr=%.6f",
+        optimizer_options["name"],
+        optimizer_options["differential_lr"],
+        float(optimizer_options["lr"]),
+        float(optimizer_options["backbone_lr"]),
+        float(optimizer_options["classifier_lr"]),
+    )
+    logging.info(
+        "Finetune config | enabled=%s freeze_backbone_epochs=%s unfreeze_strategy=%s reinit_optimizer_on_unfreeze=%s reset_scheduler_on_unfreeze=%s train_bn_when_frozen=%s",
+        finetune_config["enabled"],
+        finetune_config["freeze_backbone_epochs"],
+        finetune_config["unfreeze_strategy"],
+        finetune_config["reinit_optimizer_on_unfreeze"],
+        finetune_config["reset_scheduler_on_unfreeze"],
+        finetune_config["train_bn_when_frozen"],
+    )
     logging.info(
         "Whole image config | image_size=%s cache_size=%s interpolation=%s cache_enabled=%s cached_inputs=%s",
         whole_image_config.get("image_size", 512),
@@ -293,11 +557,56 @@ def run_training(config: dict[str, Any]) -> Path:
     )
     logging.info("Train images: %s | Val images: %s", len(train_loader.dataset), len(val_loader.dataset))
 
-    num_epochs = int(config.get("train", {}).get("epochs", 20))
-    history: list[dict[str, float | int | str | None]] = []
+    history: list[dict[str, float | int | str | bool | None]] = []
     best_metric = float("-inf")
 
     for epoch in range(1, num_epochs + 1):
+        should_unfreeze_now = (
+            use_frozen_head_stage
+            and not backbone_trainable
+            and epoch == int(finetune_config["freeze_backbone_epochs"]) + 1
+        )
+        if should_unfreeze_now:
+            backbone_trainable = True
+            backbone_unfrozen = True
+            set_backbone_trainable(
+                model,
+                backbone_name,
+                trainable=True,
+                train_bn_when_frozen=bool(finetune_config["train_bn_when_frozen"]),
+            )
+
+            if bool(finetune_config["reinit_optimizer_on_unfreeze"]):
+                previous_scheduler = scheduler
+                optimizer = build_optimizer(
+                    config=config,
+                    model=model,
+                    backbone_name=backbone_name,
+                    backbone_trainable=True,
+                )
+                if bool(finetune_config["reset_scheduler_on_unfreeze"]):
+                    scheduler = build_scheduler(config, optimizer, num_epochs=num_epochs)
+                else:
+                    scheduler = _rebuild_scheduler_with_previous_state(
+                        config=config,
+                        previous_scheduler=previous_scheduler,
+                        optimizer=optimizer,
+                        num_epochs=num_epochs,
+                    )
+            else:
+                _add_backbone_group_to_optimizer(
+                    config=config,
+                    optimizer=optimizer,
+                    model=model,
+                    backbone_name=backbone_name,
+                )
+                if bool(finetune_config["reset_scheduler_on_unfreeze"]):
+                    scheduler = build_scheduler(config, optimizer, num_epochs=num_epochs)
+
+            logging.info("Backbone unfrozen at epoch %03d", epoch)
+
+        stage = "full_finetune" if backbone_trainable else "frozen_head_only"
+
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -307,6 +616,12 @@ def run_training(config: dict[str, Any]) -> Path:
             epoch=epoch,
             scaler=scaler,
             use_amp=use_amp,
+            train_mode_configurer=lambda current_model: configure_model_train_mode(
+                model=current_model,
+                backbone_name=backbone_name,
+                backbone_trainable=backbone_trainable,
+                train_bn_when_frozen=bool(finetune_config["train_bn_when_frozen"]),
+            ),
         )
         val_metrics = validate(
             model=model,
@@ -327,10 +642,16 @@ def run_training(config: dict[str, Any]) -> Path:
             else:
                 scheduler.step()
 
+        backbone_lr, classifier_lr = _resolve_stage_learning_rates(optimizer, backbone_trainable=backbone_trainable)
         learning_rate = float(optimizer.param_groups[0]["lr"])
         epoch_record: dict[str, Any] = {
             "epoch": epoch,
             "lr": learning_rate,
+            "stage": stage,
+            "backbone_lr": backbone_lr,
+            "classifier_lr": classifier_lr,
+            "backbone_trainable": bool(backbone_trainable),
+            "backbone_unfrozen": bool(backbone_unfrozen),
             "train_loss": train_metrics["loss"],
             "train_accuracy": train_metrics["accuracy"],
             "train_macro_f1": train_metrics["macro_f1"],
@@ -344,8 +665,11 @@ def run_training(config: dict[str, Any]) -> Path:
         history.append(epoch_record)
 
         logging.info(
-            "Epoch %03d | train_loss=%.4f train_acc=%.4f train_f1=%.4f | val_loss=%.4f val_acc=%.4f val_f1=%.4f val_auc=%s | lr=%.6f",
+            "Epoch %03d | stage=%s backbone_trainable=%s unfrozen=%s | train_loss=%.4f train_acc=%.4f train_f1=%.4f | val_loss=%.4f val_acc=%.4f val_f1=%.4f val_auc=%s | backbone_lr=%s classifier_lr=%.6f",
             epoch,
+            stage,
+            backbone_trainable,
+            backbone_unfrozen,
             train_metrics["loss"],
             train_metrics["accuracy"],
             train_metrics["macro_f1"],
@@ -353,7 +677,8 @@ def run_training(config: dict[str, Any]) -> Path:
             val_metrics["accuracy"],
             val_metrics["macro_f1"],
             "N/A" if val_metrics.get("auc_ovr") is None else f"{val_metrics['auc_ovr']:.4f}",
-            learning_rate,
+            "N/A" if backbone_lr is None else f"{backbone_lr:.6f}",
+            classifier_lr,
         )
 
         save_checkpoint(run_dir / "last_model.pth", model, optimizer, epoch, epoch_record, config)

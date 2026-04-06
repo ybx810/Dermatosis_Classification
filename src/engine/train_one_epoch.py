@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from sklearn.metrics import f1_score
 from tqdm import tqdm
@@ -28,8 +30,11 @@ def train_one_epoch(
     epoch: int,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
+    train_mode_configurer: Callable[[torch.nn.Module], None] | None = None,
 ) -> dict[str, float]:
     model.train()
+    if train_mode_configurer is not None:
+        train_mode_configurer(model)
 
     running_loss = 0.0
     predictions: list[int] = []

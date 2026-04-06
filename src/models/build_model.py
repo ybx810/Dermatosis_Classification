@@ -93,6 +93,82 @@ def _build_convnext_tiny(num_classes: int, pretrained: bool, dropout: float) -> 
     return model
 
 
+def _normalize_backbone_name(backbone_name: str) -> str:
+    normalized = str(backbone_name).lower()
+    if normalized not in SUPPORTED_BACKBONES:
+        raise ValueError(
+            f"Unsupported model backbone: {normalized}. "
+            f"Currently supported: {', '.join(SUPPORTED_BACKBONES)}."
+        )
+    return normalized
+
+
+def get_classifier_module(model: nn.Module, backbone_name: str) -> nn.Module:
+    normalized_name = _normalize_backbone_name(backbone_name)
+    if normalized_name in {"resnet18", "resnet50"}:
+        classifier_module = model.fc
+    else:
+        classifier_module = model.classifier
+
+    if not isinstance(classifier_module, nn.Module):
+        raise ValueError(f"Invalid classifier module for {normalized_name}.")
+    return classifier_module
+
+
+def get_classifier_parameters(model: nn.Module, backbone_name: str) -> list[nn.Parameter]:
+    classifier_parameters = list(get_classifier_module(model, backbone_name).parameters())
+    if not classifier_parameters:
+        raise ValueError(f"Classifier parameters are empty for {backbone_name}.")
+    return classifier_parameters
+
+
+def get_backbone_parameters(model: nn.Module, backbone_name: str) -> list[nn.Parameter]:
+    classifier_parameters = get_classifier_parameters(model, backbone_name)
+    classifier_param_ids = {id(parameter) for parameter in classifier_parameters}
+    backbone_parameters = [parameter for parameter in model.parameters() if id(parameter) not in classifier_param_ids]
+
+    if not backbone_parameters:
+        raise ValueError(f"Backbone parameters are empty for {backbone_name}.")
+
+    backbone_param_ids = {id(parameter) for parameter in backbone_parameters}
+    if classifier_param_ids.intersection(backbone_param_ids):
+        raise ValueError(f"Classifier and backbone parameters overlap for {backbone_name}.")
+
+    model_param_ids = {id(parameter) for parameter in model.parameters()}
+    if classifier_param_ids.union(backbone_param_ids) != model_param_ids:
+        raise ValueError(f"Classifier/backbone partition is incomplete for {backbone_name}.")
+
+    return backbone_parameters
+
+
+def get_backbone_modules(model: nn.Module, backbone_name: str) -> list[nn.Module]:
+    normalized_name = _normalize_backbone_name(backbone_name)
+    classifier_attr = "fc" if normalized_name in {"resnet18", "resnet50"} else "classifier"
+    backbone_modules = [module for child_name, module in model.named_children() if child_name != classifier_attr]
+    if not backbone_modules:
+        raise ValueError(f"Backbone modules are empty for {normalized_name}.")
+    return backbone_modules
+
+
+def set_backbone_trainable(
+    model: nn.Module,
+    backbone_name: str,
+    trainable: bool,
+    train_bn_when_frozen: bool = False,
+) -> None:
+    for parameter in get_classifier_parameters(model, backbone_name):
+        parameter.requires_grad = True
+
+    for parameter in get_backbone_parameters(model, backbone_name):
+        parameter.requires_grad = bool(trainable)
+
+    if not trainable and not train_bn_when_frozen:
+        for backbone_module in get_backbone_modules(model, backbone_name):
+            for module in backbone_module.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+
+
 def build_model(config: dict[str, Any]) -> nn.Module:
     _validate_task_mode(config)
     model_name, pretrained, num_classes, dropout = _get_model_config(config)
