@@ -41,6 +41,7 @@ class ImageSplitConfig:
     seed: int
     mode: str
     n_splits: int
+    keep_fixed_test_in_kfold: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-ratio", type=float, default=None)
     parser.add_argument("--n-splits", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--keep-fixed-test-in-kfold", dest="keep_fixed_test_in_kfold", action="store_true")
+    parser.add_argument("--no-keep-fixed-test-in-kfold", dest="keep_fixed_test_in_kfold", action="store_false")
+    parser.set_defaults(keep_fixed_test_in_kfold=None)
     return parser.parse_args()
 
 
@@ -110,10 +114,20 @@ def build_config(args: argparse.Namespace) -> ImageSplitConfig:
     test_ratio = float(args.test_ratio if args.test_ratio is not None else split_cfg.get("test_ratio", 0.15))
     n_splits = int(args.n_splits if args.n_splits is not None else split_cfg.get("n_splits", 3))
     seed = int(args.seed if args.seed is not None else split_cfg.get("seed", 42))
+    keep_fixed_test_in_kfold = bool(
+        split_cfg.get("keep_fixed_test_in_kfold", True)
+        if args.keep_fixed_test_in_kfold is None
+        else args.keep_fixed_test_in_kfold
+    )
 
     validate_ratios(train_ratio, val_ratio, test_ratio)
     if mode == "kfold" and n_splits < 2:
         raise ValueError(f"build_image_splits.n_splits must be >= 2 for kfold mode, got: {n_splits}")
+    if mode == "kfold" and not keep_fixed_test_in_kfold:
+        raise ValueError(
+            "build_image_splits.keep_fixed_test_in_kfold must be true when mode=kfold. "
+            "This workflow requires a fixed independent test split before fold construction."
+        )
 
     return ImageSplitConfig(
         raw_dir=raw_dir,
@@ -127,6 +141,7 @@ def build_config(args: argparse.Namespace) -> ImageSplitConfig:
         seed=seed,
         mode=mode,
         n_splits=n_splits,
+        keep_fixed_test_in_kfold=keep_fixed_test_in_kfold,
     )
 
 
@@ -280,6 +295,55 @@ def assign_images_to_splits(dataframe: pd.DataFrame, config: ImageSplitConfig) -
     return assigned, per_class_split_counts
 
 
+def split_fixed_test_and_trainval_pool(
+    dataframe: pd.DataFrame,
+    config: ImageSplitConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int], dict[str, int]]:
+    rng = random.Random(config.seed)
+    fixed_test_sources: set[str] = set()
+    per_class_fixed_test_counts: dict[str, int] = {}
+    per_class_trainval_pool_counts: dict[str, int] = {}
+
+    required_min_per_class = config.n_splits + 1
+    for label in sorted(dataframe["label"].unique().tolist()):
+        label_rows = dataframe[dataframe["label"] == label].copy()
+        records = label_rows.to_dict(orient="records")
+        num_images = len(records)
+        if num_images < required_min_per_class:
+            raise ValueError(
+                f"Label '{label}' has only {num_images} images, but kfold with fixed test requires at least "
+                f"n_splits + 1 = {required_min_per_class} images."
+            )
+
+        rng.shuffle(records)
+        target_test_count = int(round(num_images * config.test_ratio))
+        max_test_count = num_images - config.n_splits
+        fixed_test_count = min(max(target_test_count, 1), max_test_count)
+
+        fixed_records = records[:fixed_test_count]
+        trainval_records = records[fixed_test_count:]
+        if len(trainval_records) < config.n_splits:
+            raise RuntimeError(
+                f"Label '{label}' has only {len(trainval_records)} trainval images after fixed test extraction, "
+                f"but at least {config.n_splits} are required."
+            )
+
+        per_class_fixed_test_counts[label] = int(len(fixed_records))
+        per_class_trainval_pool_counts[label] = int(len(trainval_records))
+        for record in fixed_records:
+            fixed_test_sources.add(str(record["source_image"]))
+
+    fixed_test_df = dataframe[dataframe["source_image"].isin(fixed_test_sources)].copy().reset_index(drop=True)
+    trainval_pool_df = dataframe[~dataframe["source_image"].isin(fixed_test_sources)].copy().reset_index(drop=True)
+
+    fixed_test_df["split"] = "test"
+    trainval_pool_df["split"] = "trainval"
+
+    fixed_test_df = fixed_test_df.sort_values(by=["label", "source_image"]).reset_index(drop=True)
+    trainval_pool_df = trainval_pool_df.sort_values(by=["label", "source_image"]).reset_index(drop=True)
+    return fixed_test_df, trainval_pool_df, per_class_fixed_test_counts, per_class_trainval_pool_counts
+
+
 def assign_images_to_kfolds(dataframe: pd.DataFrame, config: ImageSplitConfig) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
     rng = random.Random(config.seed)
     fold_assignments: dict[str, int] = {}
@@ -290,8 +354,7 @@ def assign_images_to_kfolds(dataframe: pd.DataFrame, config: ImageSplitConfig) -
         records = label_rows.to_dict(orient="records")
         if len(records) < config.n_splits:
             raise ValueError(
-                f"Label '{label}' has {len(records)} source_image entries, which is less than n_splits={config.n_splits}. "
-                "This class cannot be stratified across all folds."
+                f"Label '{label}' has only {len(records)} trainval images, which is less than n_splits={config.n_splits}."
             )
 
         rng.shuffle(records)
@@ -322,6 +385,24 @@ def write_split_csvs(dataframe: pd.DataFrame, output_dir: Path) -> dict[str, Pat
         split_frame.to_csv(split_path, index=False, encoding="utf-8", columns=EXPORT_COLUMNS)
         split_paths[split_name] = split_path
     return split_paths
+
+
+def write_kfold_base_csvs(
+    output_dir: Path,
+    fixed_test_df: pd.DataFrame,
+    trainval_pool_df: pd.DataFrame,
+) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    test_csv_path = output_dir / "test_images.csv"
+    trainval_pool_csv_path = output_dir / "trainval_pool_images.csv"
+
+    fixed_test_df.to_csv(test_csv_path, index=False, encoding="utf-8", columns=EXPORT_COLUMNS)
+    trainval_pool_df.to_csv(trainval_pool_csv_path, index=False, encoding="utf-8", columns=EXPORT_COLUMNS)
+    return {
+        "test": test_csv_path,
+        "trainval_pool": trainval_pool_csv_path,
+    }
 
 
 def write_kfold_csvs(
@@ -399,27 +480,57 @@ def write_kfold_summary(
     config: ImageSplitConfig,
     dataframe: pd.DataFrame,
     label_mapping: dict[str, int],
+    per_class_fixed_test_counts: dict[str, int],
+    per_class_trainval_pool_counts: dict[str, int],
     per_class_per_fold_counts: dict[str, dict[str, int]],
+    per_fold_total_counts: dict[str, int],
     fold_csv_paths: dict[str, dict[str, Any]],
-    compatibility_split_paths: dict[str, Path],
+    test_csv_path: Path,
+    trainval_pool_csv_path: Path,
 ) -> Path:
     cv_summary_path = config.folds_dir / "cv_split_summary.json"
-    payload = {
+
+    per_fold_val_missing_labels: dict[str, list[str]] = {}
+    for fold_idx in range(config.n_splits):
+        fold_key = f"fold_{fold_idx}"
+        missing_labels = [
+            label for label in label_mapping.keys() if int(per_class_per_fold_counts.get(label, {}).get(fold_key, 0)) <= 0
+        ]
+        per_fold_val_missing_labels[fold_key] = missing_labels
+
+    test_has_all_classes = all(int(per_class_fixed_test_counts.get(label, 0)) > 0 for label in label_mapping.keys())
+    all_fold_vals_have_all_classes = all(len(missing_labels) == 0 for missing_labels in per_fold_val_missing_labels.values())
+
+    if not test_has_all_classes:
+        raise RuntimeError("Fixed test split does not cover all classes. Please adjust the split settings.")
+    if not all_fold_vals_have_all_classes:
+        raise RuntimeError(
+            "At least one fold held-out val split is missing classes: "
+            f"{per_fold_val_missing_labels}. Please adjust the split settings."
+        )
+
+    common_payload: dict[str, Any] = {
+        "mode": "kfold",
         "raw_dir": str(config.raw_dir),
         "output_dir": str(config.output_dir),
         "folds_dir": str(config.folds_dir),
-        "mode": "kfold",
-        "n_splits": int(config.n_splits),
-        "seed": int(config.seed),
         "label_mapping_path": str(config.label_mapping_path),
+        "keep_fixed_test_in_kfold": bool(config.keep_fixed_test_in_kfold),
+        "seed": int(config.seed),
+        "test_ratio": float(config.test_ratio),
+        "n_splits": int(config.n_splits),
         "total_images": int(len(dataframe)),
         "num_classes": len(label_mapping),
         "labels": list(label_mapping.keys()),
         "per_class_image_counts": {key: int(value) for key, value in dataframe["label"].value_counts().to_dict().items()},
-        "per_fold_total_counts": {
-            f"fold_{fold_idx}": int((dataframe["fold"] == fold_idx).sum()) for fold_idx in range(config.n_splits)
-        },
+        "fixed_test_total_count": int(sum(per_class_fixed_test_counts.values())),
+        "trainval_pool_total_count": int(sum(per_class_trainval_pool_counts.values())),
+        "per_class_fixed_test_counts": {key: int(value) for key, value in per_class_fixed_test_counts.items()},
+        "per_class_trainval_pool_counts": {key: int(value) for key, value in per_class_trainval_pool_counts.items()},
         "per_class_per_fold_counts": per_class_per_fold_counts,
+        "per_fold_total_counts": {key: int(value) for key, value in per_fold_total_counts.items()},
+        "test_csv": str(test_csv_path),
+        "trainval_pool_csv": str(trainval_pool_csv_path),
         "folds": {
             fold_key: {
                 "train_csv": str(payload_item["train_csv"]),
@@ -429,17 +540,25 @@ def write_kfold_summary(
             }
             for fold_key, payload_item in fold_csv_paths.items()
         },
-        "compat_single_split_csvs": {split_name: str(path) for split_name, path in compatibility_split_paths.items()},
+        "test_has_all_classes": bool(test_has_all_classes),
+        "all_fold_vals_have_all_classes": bool(all_fold_vals_have_all_classes),
+        "per_fold_val_missing_labels": per_fold_val_missing_labels,
+        "kfold_note": "In mode=kfold, test_ratio is used to extract a fixed independent test split first; train_ratio and val_ratio are ignored for fold construction.",
     }
 
-    targets = [cv_summary_path]
-    if summary_path.resolve() != cv_summary_path.resolve():
-        targets.append(summary_path)
+    split_summary_payload = {
+        **common_payload,
+        "cv_summary_path": str(cv_summary_path),
+    }
+    cv_summary_payload = {
+        **common_payload,
+        "split_summary_path": str(summary_path),
+    }
 
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    config.folds_dir.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(split_summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    cv_summary_path.write_text(json.dumps(cv_summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return cv_summary_path
 
 
@@ -461,26 +580,40 @@ def build_image_splits(config: ImageSplitConfig) -> dict[str, Any]:
             "summary_path": config.summary_path,
         }
 
-    assigned, per_class_per_fold_counts = assign_images_to_kfolds(dataframe, config)
-    fold_csv_paths = write_kfold_csvs(assigned, config.folds_dir, config.n_splits)
+    logging.info(
+        "mode=kfold will first create a fixed independent test split using test_ratio=%.4f, then run %d-fold CV on the remaining trainval pool. train_ratio/val_ratio are ignored for fold construction.",
+        config.test_ratio,
+        config.n_splits,
+    )
+    fixed_test_df, trainval_pool_df, per_class_fixed_test_counts, per_class_trainval_pool_counts = split_fixed_test_and_trainval_pool(
+        dataframe,
+        config,
+    )
+    kfold_assigned, per_class_per_fold_counts = assign_images_to_kfolds(trainval_pool_df, config)
+    fold_csv_paths = write_kfold_csvs(kfold_assigned, config.folds_dir, config.n_splits)
+    kfold_base_paths = write_kfold_base_csvs(config.output_dir, fixed_test_df, trainval_pool_df)
 
-    compatibility_assigned, _ = assign_images_to_splits(dataframe, config)
-    compatibility_assigned = compatibility_assigned[EXPORT_COLUMNS].reset_index(drop=True)
-    compatibility_split_paths = write_split_csvs(compatibility_assigned, config.output_dir)
-
+    per_fold_total_counts = {
+        f"fold_{fold_idx}": int((kfold_assigned["fold"] == fold_idx).sum()) for fold_idx in range(config.n_splits)
+    }
     cv_summary_path = write_kfold_summary(
         summary_path=config.summary_path,
         config=config,
-        dataframe=assigned,
+        dataframe=dataframe,
         label_mapping=label_mapping,
+        per_class_fixed_test_counts=per_class_fixed_test_counts,
+        per_class_trainval_pool_counts=per_class_trainval_pool_counts,
         per_class_per_fold_counts=per_class_per_fold_counts,
+        per_fold_total_counts=per_fold_total_counts,
         fold_csv_paths=fold_csv_paths,
-        compatibility_split_paths=compatibility_split_paths,
+        test_csv_path=kfold_base_paths["test"],
+        trainval_pool_csv_path=kfold_base_paths["trainval_pool"],
     )
     return {
         "mode": "kfold",
         "fold_csv_paths": fold_csv_paths,
-        "split_paths": compatibility_split_paths,
+        "test_csv": kfold_base_paths["test"],
+        "trainval_pool_csv": kfold_base_paths["trainval_pool"],
         "summary_path": config.summary_path,
         "cv_summary_path": cv_summary_path,
     }
@@ -501,6 +634,8 @@ def main() -> None:
         logging.info("Test CSV: %s", split_paths["test"])
         logging.info("Summary: %s", result["summary_path"])
     else:
+        logging.info("Fixed test CSV: %s", result["test_csv"])
+        logging.info("Trainval pool CSV: %s", result["trainval_pool_csv"])
         logging.info("Folds directory: %s", config.folds_dir)
         for fold_key, fold_payload in result["fold_csv_paths"].items():
             logging.info(
@@ -511,18 +646,9 @@ def main() -> None:
                 fold_payload["train_count"],
                 fold_payload["val_count"],
             )
-        split_paths = result["split_paths"]
-        logging.info(
-            "Compatibility single split CSVs | train=%s val=%s test=%s",
-            split_paths["train"],
-            split_paths["val"],
-            split_paths["test"],
-        )
+        logging.info("Summary: %s", result["summary_path"])
         logging.info("CV Summary: %s", result["cv_summary_path"])
-        if Path(result["summary_path"]).resolve() != Path(result["cv_summary_path"]).resolve():
-            logging.info("Summary alias: %s", result["summary_path"])
 
 
 if __name__ == "__main__":
     main()
-

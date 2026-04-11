@@ -24,6 +24,7 @@ build_image_splits:
   test_ratio: 0.15
   n_splits: 3
   seed: 42
+  keep_fixed_test_in_kfold: true
 
 whole_image:
   train_csv: data/splits/train_images.csv
@@ -90,4 +91,7 @@ scheduler:
 
 evaluation:
   primary_metric: macro_f1
+
+
+
 

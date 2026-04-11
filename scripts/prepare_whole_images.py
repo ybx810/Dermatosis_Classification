@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import hashlib
@@ -159,9 +159,20 @@ def build_config(args: argparse.Namespace) -> WholeImageCacheConfig:
 
     raw_dir = resolve_path(args.raw_dir or data_cfg.get("raw_dir"), "data/raw")
     default_split_dir = split_cfg.get("output_dir") or data_cfg.get("split_dir") or "data/splits"
-    train_csv = resolve_path(args.train_csv or whole_image_cfg.get("train_csv"), f"{default_split_dir}/train_images.csv")
-    val_csv = resolve_path(args.val_csv or whole_image_cfg.get("val_csv"), f"{default_split_dir}/val_images.csv")
-    test_csv = resolve_path(args.test_csv or whole_image_cfg.get("test_csv"), f"{default_split_dir}/test_images.csv")
+
+    split_mode = str(split_cfg.get("mode", "single")).lower()
+    keep_fixed_test_in_kfold = bool(split_cfg.get("keep_fixed_test_in_kfold", True))
+    if split_mode == "kfold" and keep_fixed_test_in_kfold:
+        # In kfold mode we preprocess the full dataset using trainval pool + fixed test once;
+        # fold-specific CSVs are not needed for cache generation.
+        default_trainval_pool_csv = f"{default_split_dir}/trainval_pool_images.csv"
+        train_csv = resolve_path(args.train_csv, default_trainval_pool_csv)
+        val_csv = resolve_path(args.val_csv, default_trainval_pool_csv)
+        test_csv = resolve_path(args.test_csv or whole_image_cfg.get("test_csv"), f"{default_split_dir}/test_images.csv")
+    else:
+        train_csv = resolve_path(args.train_csv or whole_image_cfg.get("train_csv"), f"{default_split_dir}/train_images.csv")
+        val_csv = resolve_path(args.val_csv or whole_image_cfg.get("val_csv"), f"{default_split_dir}/val_images.csv")
+        test_csv = resolve_path(args.test_csv or whole_image_cfg.get("test_csv"), f"{default_split_dir}/test_images.csv")
     output_dir = resolve_path(args.output_dir or cache_cfg.get("dir"), "data/cache/whole_images")
     metadata_path = resolve_path(args.metadata_path or cache_cfg.get("metadata_path"), "data/metadata/whole_image_metadata.csv")
     summary_path = resolve_path(args.summary_path or cache_cfg.get("summary_path"), "data/metadata/whole_image_summary.json")
@@ -565,3 +576,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
