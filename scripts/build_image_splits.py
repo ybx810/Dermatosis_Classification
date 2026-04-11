@@ -9,6 +9,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -23,6 +24,7 @@ SPLIT_NAMES = ("train", "val", "test")
 COVERAGE_SPLITS = ("train", "val", "test")
 LIMITED_IMAGE_PRIORITY = ("train", "test", "val")
 EXTRA_IMAGE_PRIORITY = ("test", "train", "val")
+SUPPORTED_MODES = {"single", "kfold"}
 EXPORT_COLUMNS = ["source_image", "label", "label_idx", "patient_id", "split"]
 
 
@@ -30,24 +32,30 @@ EXPORT_COLUMNS = ["source_image", "label", "label_idx", "patient_id", "split"]
 class ImageSplitConfig:
     raw_dir: Path
     output_dir: Path
+    folds_dir: Path
     label_mapping_path: Path
     summary_path: Path
     train_ratio: float
     val_ratio: float
     test_ratio: float
     seed: int
+    mode: str
+    n_splits: int
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build image-level train/val/test splits from raw whole images.")
+    parser = argparse.ArgumentParser(description="Build image-level splits from raw whole images.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--mode", type=str, choices=sorted(SUPPORTED_MODES), default=None)
     parser.add_argument("--raw-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--folds-dir", type=str, default=None)
     parser.add_argument("--label-mapping-path", type=str, default=None)
     parser.add_argument("--summary-path", type=str, default=None)
     parser.add_argument("--train-ratio", type=float, default=None)
     parser.add_argument("--val-ratio", type=float, default=None)
     parser.add_argument("--test-ratio", type=float, default=None)
+    parser.add_argument("--n-splits", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -82,8 +90,13 @@ def build_config(args: argparse.Namespace) -> ImageSplitConfig:
     data_cfg = config.get("data", {})
     split_cfg = config.get("build_image_splits", {})
 
+    mode = str(args.mode or split_cfg.get("mode", "single")).strip().lower()
+    if mode not in SUPPORTED_MODES:
+        raise ValueError(f"Unsupported build_image_splits.mode={mode!r}. Expected one of {sorted(SUPPORTED_MODES)}.")
+
     raw_dir = resolve_path(args.raw_dir or data_cfg.get("raw_dir"), "data/raw")
     output_dir = resolve_path(args.output_dir or split_cfg.get("output_dir") or data_cfg.get("split_dir"), "data/splits")
+    folds_dir = resolve_path(args.folds_dir or split_cfg.get("folds_dir"), "data/splits/cv3")
     label_mapping_path = resolve_path(
         args.label_mapping_path or split_cfg.get("label_mapping_path"),
         "data/splits/label_mapping.json",
@@ -95,18 +108,25 @@ def build_config(args: argparse.Namespace) -> ImageSplitConfig:
     train_ratio = float(args.train_ratio if args.train_ratio is not None else split_cfg.get("train_ratio", 0.7))
     val_ratio = float(args.val_ratio if args.val_ratio is not None else split_cfg.get("val_ratio", 0.15))
     test_ratio = float(args.test_ratio if args.test_ratio is not None else split_cfg.get("test_ratio", 0.15))
+    n_splits = int(args.n_splits if args.n_splits is not None else split_cfg.get("n_splits", 3))
     seed = int(args.seed if args.seed is not None else split_cfg.get("seed", 42))
 
     validate_ratios(train_ratio, val_ratio, test_ratio)
+    if mode == "kfold" and n_splits < 2:
+        raise ValueError(f"build_image_splits.n_splits must be >= 2 for kfold mode, got: {n_splits}")
+
     return ImageSplitConfig(
         raw_dir=raw_dir,
         output_dir=output_dir,
+        folds_dir=folds_dir,
         label_mapping_path=label_mapping_path,
         summary_path=summary_path,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
         seed=seed,
+        mode=mode,
+        n_splits=n_splits,
     )
 
 
@@ -260,6 +280,39 @@ def assign_images_to_splits(dataframe: pd.DataFrame, config: ImageSplitConfig) -
     return assigned, per_class_split_counts
 
 
+def assign_images_to_kfolds(dataframe: pd.DataFrame, config: ImageSplitConfig) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
+    rng = random.Random(config.seed)
+    fold_assignments: dict[str, int] = {}
+    per_class_per_fold_counts: dict[str, dict[str, int]] = {}
+
+    for label in sorted(dataframe["label"].unique().tolist()):
+        label_rows = dataframe[dataframe["label"] == label].copy()
+        records = label_rows.to_dict(orient="records")
+        if len(records) < config.n_splits:
+            raise ValueError(
+                f"Label '{label}' has {len(records)} source_image entries, which is less than n_splits={config.n_splits}. "
+                "This class cannot be stratified across all folds."
+            )
+
+        rng.shuffle(records)
+        per_fold_counts = {f"fold_{fold_idx}": 0 for fold_idx in range(config.n_splits)}
+        for record_index, record in enumerate(records):
+            fold_idx = record_index % config.n_splits
+            source_image = str(record["source_image"])
+            fold_assignments[source_image] = fold_idx
+            per_fold_counts[f"fold_{fold_idx}"] += 1
+        per_class_per_fold_counts[label] = per_fold_counts
+
+    assigned = dataframe.copy()
+    assigned["fold"] = assigned["source_image"].map(fold_assignments)
+    if assigned["fold"].isna().any():
+        missing_sources = assigned.loc[assigned["fold"].isna(), "source_image"].tolist()
+        raise RuntimeError(f"Failed to assign folds for source_image entries: {missing_sources[:5]}")
+
+    assigned["fold"] = assigned["fold"].astype(int)
+    return assigned, per_class_per_fold_counts
+
+
 def write_split_csvs(dataframe: pd.DataFrame, output_dir: Path) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     split_paths: dict[str, Path] = {}
@@ -271,6 +324,36 @@ def write_split_csvs(dataframe: pd.DataFrame, output_dir: Path) -> dict[str, Pat
     return split_paths
 
 
+def write_kfold_csvs(
+    dataframe: pd.DataFrame,
+    folds_dir: Path,
+    n_splits: int,
+) -> dict[str, dict[str, Any]]:
+    folds_dir.mkdir(parents=True, exist_ok=True)
+    fold_csv_paths: dict[str, dict[str, Any]] = {}
+    for fold_idx in range(n_splits):
+        fold_key = f"fold_{fold_idx}"
+        val_frame = dataframe[dataframe["fold"] == fold_idx].copy()
+        train_frame = dataframe[dataframe["fold"] != fold_idx].copy()
+
+        train_frame["split"] = "train"
+        val_frame["split"] = "val"
+        train_frame = train_frame.sort_values(by=["label", "source_image"]).reset_index(drop=True)
+        val_frame = val_frame.sort_values(by=["label", "source_image"]).reset_index(drop=True)
+
+        train_path = folds_dir / f"{fold_key}_train_images.csv"
+        val_path = folds_dir / f"{fold_key}_val_images.csv"
+        train_frame.to_csv(train_path, index=False, encoding="utf-8", columns=EXPORT_COLUMNS)
+        val_frame.to_csv(val_path, index=False, encoding="utf-8", columns=EXPORT_COLUMNS)
+        fold_csv_paths[fold_key] = {
+            "train_csv": train_path,
+            "val_csv": val_path,
+            "train_count": int(len(train_frame)),
+            "val_count": int(len(val_frame)),
+        }
+    return fold_csv_paths
+
+
 def write_label_mapping(label_mapping: dict[str, int], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -280,7 +363,7 @@ def write_label_mapping(label_mapping: dict[str, int], output_path: Path) -> Non
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_summary(
+def write_single_summary(
     summary_path: Path,
     config: ImageSplitConfig,
     dataframe: pd.DataFrame,
@@ -291,6 +374,7 @@ def write_summary(
     payload = {
         "raw_dir": str(config.raw_dir),
         "output_dir": str(config.output_dir),
+        "mode": "single",
         "label_mapping_path": str(config.label_mapping_path),
         "train_ratio": config.train_ratio,
         "val_ratio": config.val_ratio,
@@ -310,31 +394,135 @@ def write_summary(
     summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_image_splits(config: ImageSplitConfig) -> dict[str, Path]:
+def write_kfold_summary(
+    summary_path: Path,
+    config: ImageSplitConfig,
+    dataframe: pd.DataFrame,
+    label_mapping: dict[str, int],
+    per_class_per_fold_counts: dict[str, dict[str, int]],
+    fold_csv_paths: dict[str, dict[str, Any]],
+    compatibility_split_paths: dict[str, Path],
+) -> Path:
+    cv_summary_path = config.folds_dir / "cv_split_summary.json"
+    payload = {
+        "raw_dir": str(config.raw_dir),
+        "output_dir": str(config.output_dir),
+        "folds_dir": str(config.folds_dir),
+        "mode": "kfold",
+        "n_splits": int(config.n_splits),
+        "seed": int(config.seed),
+        "label_mapping_path": str(config.label_mapping_path),
+        "total_images": int(len(dataframe)),
+        "num_classes": len(label_mapping),
+        "labels": list(label_mapping.keys()),
+        "per_class_image_counts": {key: int(value) for key, value in dataframe["label"].value_counts().to_dict().items()},
+        "per_fold_total_counts": {
+            f"fold_{fold_idx}": int((dataframe["fold"] == fold_idx).sum()) for fold_idx in range(config.n_splits)
+        },
+        "per_class_per_fold_counts": per_class_per_fold_counts,
+        "folds": {
+            fold_key: {
+                "train_csv": str(payload_item["train_csv"]),
+                "val_csv": str(payload_item["val_csv"]),
+                "train_count": int(payload_item["train_count"]),
+                "val_count": int(payload_item["val_count"]),
+            }
+            for fold_key, payload_item in fold_csv_paths.items()
+        },
+        "compat_single_split_csvs": {split_name: str(path) for split_name, path in compatibility_split_paths.items()},
+    }
+
+    targets = [cv_summary_path]
+    if summary_path.resolve() != cv_summary_path.resolve():
+        targets.append(summary_path)
+
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return cv_summary_path
+
+
+def build_image_splits(config: ImageSplitConfig) -> dict[str, Any]:
     dataframe = build_image_dataframe(config.raw_dir)
     label_mapping = build_label_mapping(dataframe)
     dataframe["label_idx"] = dataframe["label"].map(label_mapping).astype(int)
-    assigned, per_class_split_counts = assign_images_to_splits(dataframe, config)
-    assigned = assigned[EXPORT_COLUMNS].reset_index(drop=True)
-
-    split_paths = write_split_csvs(assigned, config.output_dir)
     write_label_mapping(label_mapping, config.label_mapping_path)
-    write_summary(config.summary_path, config, assigned, label_mapping, per_class_split_counts, split_paths)
-    return split_paths
+
+    if config.mode == "single":
+        assigned, per_class_split_counts = assign_images_to_splits(dataframe, config)
+        assigned = assigned[EXPORT_COLUMNS].reset_index(drop=True)
+
+        split_paths = write_split_csvs(assigned, config.output_dir)
+        write_single_summary(config.summary_path, config, assigned, label_mapping, per_class_split_counts, split_paths)
+        return {
+            "mode": "single",
+            "split_paths": split_paths,
+            "summary_path": config.summary_path,
+        }
+
+    assigned, per_class_per_fold_counts = assign_images_to_kfolds(dataframe, config)
+    fold_csv_paths = write_kfold_csvs(assigned, config.folds_dir, config.n_splits)
+
+    compatibility_assigned, _ = assign_images_to_splits(dataframe, config)
+    compatibility_assigned = compatibility_assigned[EXPORT_COLUMNS].reset_index(drop=True)
+    compatibility_split_paths = write_split_csvs(compatibility_assigned, config.output_dir)
+
+    cv_summary_path = write_kfold_summary(
+        summary_path=config.summary_path,
+        config=config,
+        dataframe=assigned,
+        label_mapping=label_mapping,
+        per_class_per_fold_counts=per_class_per_fold_counts,
+        fold_csv_paths=fold_csv_paths,
+        compatibility_split_paths=compatibility_split_paths,
+    )
+    return {
+        "mode": "kfold",
+        "fold_csv_paths": fold_csv_paths,
+        "split_paths": compatibility_split_paths,
+        "summary_path": config.summary_path,
+        "cv_summary_path": cv_summary_path,
+    }
 
 
 def main() -> None:
     args = parse_args()
     setup_logging()
     config = build_config(args)
-    split_paths = build_image_splits(config)
-    logging.info("Built image-level splits from raw_dir=%s", config.raw_dir)
-    logging.info("Train CSV: %s", split_paths["train"])
-    logging.info("Val CSV: %s", split_paths["val"])
-    logging.info("Test CSV: %s", split_paths["test"])
+    result = build_image_splits(config)
+
+    logging.info("Built image-level splits from raw_dir=%s | mode=%s", config.raw_dir, result["mode"])
     logging.info("Label mapping: %s", config.label_mapping_path)
-    logging.info("Summary: %s", config.summary_path)
+    if result["mode"] == "single":
+        split_paths = result["split_paths"]
+        logging.info("Train CSV: %s", split_paths["train"])
+        logging.info("Val CSV: %s", split_paths["val"])
+        logging.info("Test CSV: %s", split_paths["test"])
+        logging.info("Summary: %s", result["summary_path"])
+    else:
+        logging.info("Folds directory: %s", config.folds_dir)
+        for fold_key, fold_payload in result["fold_csv_paths"].items():
+            logging.info(
+                "%s | train_csv=%s val_csv=%s train_count=%d val_count=%d",
+                fold_key,
+                fold_payload["train_csv"],
+                fold_payload["val_csv"],
+                fold_payload["train_count"],
+                fold_payload["val_count"],
+            )
+        split_paths = result["split_paths"]
+        logging.info(
+            "Compatibility single split CSVs | train=%s val=%s test=%s",
+            split_paths["train"],
+            split_paths["val"],
+            split_paths["test"],
+        )
+        logging.info("CV Summary: %s", result["cv_summary_path"])
+        if Path(result["summary_path"]).resolve() != Path(result["cv_summary_path"]).resolve():
+            logging.info("Summary alias: %s", result["summary_path"])
 
 
 if __name__ == "__main__":
     main()
+

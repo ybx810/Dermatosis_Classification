@@ -1,4 +1,4 @@
-﻿project:
+project:
   name: large-medical-image-whole-image-classification
   task: whole-image-classification
   output_dir: outputs
@@ -14,12 +14,15 @@ data:
   num_classes: 16
 
 build_image_splits:
+  mode: single
   output_dir: data/splits
+  folds_dir: data/splits/cv3
   label_mapping_path: data/splits/label_mapping.json
   summary_path: data/splits/split_summary.json
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
+  n_splits: 3
   seed: 42
 
 whole_image:
@@ -87,3 +90,4 @@ scheduler:
 
 evaluation:
   primary_metric: macro_f1
+

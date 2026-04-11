@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -65,6 +65,17 @@ def build_run_dir(config: dict[str, Any]) -> Path:
     run_dir = output_root / project_name / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def resolve_run_dir(
+    config: dict[str, Any],
+    run_dir: str | Path | None = None,
+    run_name: str | None = None,
+) -> Path:
+    base_run_dir = resolve_path(run_dir) if run_dir is not None else build_run_dir(config)
+    final_run_dir = base_run_dir / run_name if run_name else base_run_dir
+    final_run_dir.mkdir(parents=True, exist_ok=True)
+    return final_run_dir
 
 
 def save_config_snapshot(config: dict[str, Any], run_dir: Path) -> None:
@@ -223,22 +234,26 @@ def _resolve_split_csvs(config: dict[str, Any]) -> tuple[Path, Path, Path]:
     return train_csv, val_csv, label_mapping_path
 
 
-def run_training(config: dict[str, Any]) -> Path:
+def run_training(
+    config: dict[str, Any],
+    run_dir: str | Path | None = None,
+    run_name: str | None = None,
+) -> dict[str, Any]:
     _validate_task_mode(config)
     primary_metric = _resolve_primary_metric(config)
 
     seed = int(config.get("train", {}).get("seed", 42))
     seed_everything(seed)
 
-    run_dir = build_run_dir(config)
-    setup_logging(run_dir / "train.log")
-    save_config_snapshot(config, run_dir)
+    resolved_run_dir = resolve_run_dir(config, run_dir=run_dir, run_name=run_name)
+    setup_logging(resolved_run_dir / "train.log")
+    save_config_snapshot(config, resolved_run_dir)
 
     device = select_device(config)
     use_amp = bool(config.get("train", {}).get("mixed_precision", True) and device.type == "cuda")
     whole_image_config = config.get("whole_image", {})
     cache_config = whole_image_config.get("cache", {})
-    logging.info("Run directory: %s", run_dir)
+    logging.info("Run directory: %s", resolved_run_dir)
     logging.info("Device: %s", device)
     logging.info("AMP enabled: %s", use_amp)
     logging.info("Task mode: %s", SUPPORTED_TASK_MODE)
@@ -296,6 +311,8 @@ def run_training(config: dict[str, Any]) -> Path:
     num_epochs = int(config.get("train", {}).get("epochs", 20))
     history: list[dict[str, float | int | str | None]] = []
     best_metric = float("-inf")
+    best_epoch: int | None = None
+    best_metrics: dict[str, Any] | None = None
 
     for epoch in range(1, num_epochs + 1):
         train_metrics = train_one_epoch(
@@ -356,27 +373,53 @@ def run_training(config: dict[str, Any]) -> Path:
             learning_rate,
         )
 
-        save_checkpoint(run_dir / "last_model.pth", model, optimizer, epoch, epoch_record, config)
+        save_checkpoint(resolved_run_dir / "last_model.pth", model, optimizer, epoch, epoch_record, config)
         current_metric = val_metrics.get(primary_metric)
         if current_metric is None:
             current_metric = val_metrics["macro_f1"]
         if float(current_metric) >= best_metric:
             best_metric = float(current_metric)
-            save_checkpoint(run_dir / "best_model.pth", model, optimizer, epoch, epoch_record, config)
+            best_epoch = int(epoch)
+            best_metrics = {
+                "loss": val_metrics.get("loss"),
+                "accuracy": val_metrics.get("accuracy"),
+                "precision": val_metrics.get("precision"),
+                "recall": val_metrics.get("recall"),
+                "macro_f1": val_metrics.get("macro_f1"),
+                "auc_ovr": val_metrics.get("auc_ovr"),
+                "num_samples": val_metrics.get("num_samples"),
+                "sample_level": val_metrics.get("sample_level"),
+            }
+            save_checkpoint(resolved_run_dir / "best_model.pth", model, optimizer, epoch, epoch_record, config)
             logging.info("Updated best model at epoch %03d with %s=%.4f", epoch, primary_metric, best_metric)
 
-    history_path = run_dir / "history.json"
+    history_path = resolved_run_dir / "history.json"
     history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Saved training history to %s", history_path)
 
-    visualization_outputs = export_training_visualizations(history_path, run_dir)
+    visualization_outputs = export_training_visualizations(history_path, resolved_run_dir)
     if visualization_outputs:
         logging.info("Saved loss curve to %s", visualization_outputs.get("loss_curve"))
         logging.info("Saved metric curve to %s", visualization_outputs.get("metric_curve"))
     else:
         logging.warning("Training history is empty. Skipping visualization export.")
 
-    return run_dir
+    best_model_path = resolved_run_dir / "best_model.pth"
+    if best_epoch is None or not best_model_path.exists():
+        raise RuntimeError(
+            "Training did not produce a best model checkpoint. "
+            "Please check train.epochs and validation metric configuration."
+        )
+
+    return {
+        "run_dir": str(resolved_run_dir),
+        "best_model_path": str(best_model_path),
+        "best_epoch": int(best_epoch),
+        "primary_metric": primary_metric,
+        "best_metric_value": float(best_metric),
+        "final_history_path": str(history_path),
+        "best_metrics": best_metrics or {},
+    }
 
 
 def main() -> None:
@@ -387,3 +430,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -1,14 +1,14 @@
-﻿# Large Medical Whole-Image Classification
+# Large Medical Whole-Image Classification
 
 This repository is a pure whole-image classification project.
 
 The training, validation, and test sample unit is always one `source_image`.
-The whole-image workflow is now a single offline geometry preprocessing path:
+The whole-image workflow is a single offline geometry preprocessing path:
 
 1. build image-level splits from raw whole images
 2. run `scripts/prepare_whole_images.py` to convert raw whole images into fixed-size square cached images
 3. train a single-branch classifier directly on those cached whole images
-4. evaluate checkpoints with image-level metrics and per-class metrics
+4. optionally evaluate checkpoints with image-level metrics and per-class metrics
 
 ## Project Layout
 
@@ -31,23 +31,30 @@ The whole-image workflow is now a single offline geometry preprocessing path:
 
 ## 1. Build Image Splits
 
-Generate image-level train/val/test CSV files directly from the raw whole-image directory:
+Generate image-level split CSV files directly from the raw whole-image directory:
 
 ```bash
 python scripts/build_image_splits.py --config configs/default.yaml
 ```
 
-Outputs:
+`build_image_splits.mode` supports two modes:
 
-- `data/splits/train_images.csv`
-- `data/splits/val_images.csv`
-- `data/splits/test_images.csv`
-- `data/splits/label_mapping.json`
-- `data/splits/split_summary.json`
+- `single`: keep the original train/val/test split workflow
+- `kfold`: generate stratified k-fold CSVs (default `n_splits=3`)
 
-Each row corresponds to one `source_image`. The split builder keeps train/val/test mutually exclusive at image level.
+When `mode=kfold`, outputs include:
 
-## 2. Prepare Cached Whole Images
+- `data/splits/cv3/fold_0_train_images.csv`
+- `data/splits/cv3/fold_0_val_images.csv`
+- `data/splits/cv3/fold_1_train_images.csv`
+- `data/splits/cv3/fold_1_val_images.csv`
+- `data/splits/cv3/fold_2_train_images.csv`
+- `data/splits/cv3/fold_2_val_images.csv`
+- `data/splits/cv3/cv_split_summary.json`
+
+The script still writes one shared `data/splits/label_mapping.json` and keeps compatibility train/val/test CSVs under `data/splits/`.
+
+## 2. Prepare Cached Whole Images (One-Time)
 
 Prepare fixed-size cached whole-image copies before training:
 
@@ -70,10 +77,11 @@ Behavior:
 - `whole_image.interpolation` controls the offline downsampling interpolation and supports `area` and `bilinear`
 
 This offline script is the only place where whole-image resize and padding happen.
+For 3-fold cross-validation, cache preparation is still done only once for the full dataset.
 
-## 3. Train
+## 3. Train (Single Run)
 
-Run training with:
+Run a normal single training run with:
 
 ```bash
 python scripts/train.py --config configs/default.yaml
@@ -91,7 +99,43 @@ Behavior:
 - validation uses direct image-level metrics
 - best model selection defaults to validation `macro_f1`
 
-## 4. Test
+## 4. 3-Fold Cross-Validation
+
+Run 3-fold cross-validation training with:
+
+```bash
+python scripts/cross_validate.py --config configs/default.yaml
+```
+
+Cross-validation runner behavior:
+
+- reads fold CSVs from `build_image_splits.folds_dir`
+- sequentially trains `fold_0`, `fold_1`, `fold_2`
+- for each fold, uses `fold_i_train_images.csv` as train and `fold_i_val_images.csv` as held-out eval
+- reuses the same whole-image cache metadata and cached files (no fold-specific cache regeneration)
+
+Outputs are written to:
+
+```text
+outputs/<project_name>/crossval/<timestamp>/
+```
+
+including:
+
+- `fold_0/`, `fold_1/`, `fold_2/` run directories
+- `per_fold_results.csv`
+- `crossval_summary.json`
+- `crossval_summary.csv`
+
+`crossval_summary.json/csv` reports per-fold metrics and mean/std for:
+
+- accuracy
+- precision
+- recall
+- macro_f1
+- auc_ovr
+
+## 5. Test (Single Checkpoint)
 
 Evaluate a checkpoint with the same whole-image config:
 
@@ -111,11 +155,25 @@ Files written by the test step:
 - `confusion_matrix.png`
 - `per_class_metrics.csv`
 
-`metrics.json` includes image-level accuracy, macro precision, macro recall, macro F1, optional multi-class AUC, confusion matrix, and per-class metrics.
+## 6. Key Config
 
-## 5. Key Config
+The split config block:
 
-The whole-image config block looks like this:
+```yaml
+build_image_splits:
+  mode: single
+  output_dir: data/splits
+  folds_dir: data/splits/cv3
+  label_mapping_path: data/splits/label_mapping.json
+  summary_path: data/splits/split_summary.json
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  n_splits: 3
+  seed: 42
+```
+
+The whole-image config block:
 
 ```yaml
 whole_image:
@@ -142,7 +200,9 @@ whole_image:
 `whole_image.image_size` is the single source of truth for both offline cached image size and model input size.
 If an older config still contains `whole_image.cache.size`, it is treated as deprecated and must match `whole_image.image_size`.
 
-## 6. Standard Workflow
+## 7. Standard Workflows
+
+Single-run workflow:
 
 ```bash
 python scripts/build_image_splits.py --config configs/default.yaml
@@ -151,8 +211,19 @@ python scripts/train.py --config configs/default.yaml
 python scripts/test.py --config configs/default.yaml --checkpoint outputs/<project>/<run>/best_model.pth
 ```
 
+3-fold cross-validation workflow:
+
+```bash
+python scripts/build_image_splits.py --config configs/default.yaml
+python scripts/prepare_whole_images.py --config configs/default.yaml
+python scripts/cross_validate.py --config configs/default.yaml
+```
+
+Before running cross-validation, set `build_image_splits.mode: kfold` in `configs/default.yaml`.
+
 ## Install
 
 ```bash
 pip install -r requirements.txt
 ```
+
