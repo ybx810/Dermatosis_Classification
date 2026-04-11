@@ -99,12 +99,61 @@ Notes:
 
 - offline script is the only place doing resize + padding
 - training/validation/testing do not redo geometry transforms
+- random augmentation is not applied in cache preparation
 - in `mode=kfold`, cache preparation is still run once for full data (`trainval_pool + fixed_test`), not per fold
 
 ## 3. Train (Single Mode)
 
 ```bash
 python scripts/train.py --config configs/default.yaml
+```
+
+## Online Augmentation
+
+Online augmentation is applied only in dataset transforms, never in offline cache generation.
+
+Rules:
+
+- train split: augmentation allowed
+- val split: no random augmentation
+- test split: no random augmentation
+- kfold mode: each fold constructs its own train/val datasets and transforms; fold-train uses augmentation, fold-val does not
+- fixed test set in kfold mode always uses deterministic transforms
+
+Train transform order:
+
+1. `RandomResizedCrop` (if enabled)
+2. `Rotate` (if enabled)
+3. `HorizontalFlip` (if probability > 0)
+4. `VerticalFlip` (if probability > 0)
+5. `Normalize`
+6. `ToTensorV2`
+
+Val/test transform order:
+
+1. `Normalize`
+2. `ToTensorV2`
+
+Config example (`configs/default.yaml`):
+
+```yaml
+train:
+  augmentation:
+    random_resized_crop:
+      enabled: false
+      p: 0.5
+      scale: [0.85, 1.0]
+      ratio: [0.95, 1.05]
+    rotate:
+      enabled: false
+      p: 0.5
+      limit: 10
+      border_mode: constant
+      fill: 0
+      crop_border: false
+    horizontal_flip: 0.5
+    vertical_flip: 0.5
+    normalize: imagenet
 ```
 
 ## 4. Test One Checkpoint

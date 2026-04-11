@@ -1,4 +1,4 @@
-﻿project:
+project:
   name: large-medical-image-whole-image-classification-efficientnet-b0
   task: whole-image-classification
   output_dir: outputs
@@ -49,6 +49,12 @@ train:
   device: cuda
   mixed_precision: true
   seed: 42
+  sampling:
+    enabled: false
+    strategy: none
+    replacement: true
+    epoch_size: auto
+    log_distribution: true
 
 dataloader:
   pin_memory: true

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -10,11 +10,32 @@ import pandas as pd
 from PIL import Image, ImageFile, UnidentifiedImageError
 from torch.utils.data import DataLoader, Dataset
 
+from src.datasets.samplers import build_train_sampler
 from src.datasets.transforms import build_whole_image_transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_COLUMNS = {"source_image", "label"}
 SUCCESS_CACHE_STATUSES = {"success", "skipped_existing"}
+
+def _merge_transform_config(config: dict[str, Any]) -> dict[str, Any]:
+    legacy_cfg = config.get("augmentation", {})
+    train_cfg = config.get("train", {})
+    train_aug_cfg = train_cfg.get("augmentation", {})
+
+    merged: dict[str, Any] = {}
+    if isinstance(legacy_cfg, dict):
+        merged.update(legacy_cfg)
+
+    if isinstance(train_aug_cfg, dict):
+        for key, value in train_aug_cfg.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                nested = dict(merged[key])
+                nested.update(value)
+                merged[key] = nested
+            else:
+                merged[key] = value
+
+    return merged
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -378,8 +399,9 @@ def build_whole_image_dataloader(
     train_config = config.get("train", {})
     dataloader_config = config.get("dataloader", {})
     split_config = config.get("build_image_splits", {})
-    transform_config = config.get("augmentation", {})
+    transform_config = _merge_transform_config(config)
     whole_image_config = config.get("whole_image", {})
+    mode_lower = mode.lower()
 
     dataset = SkinWholeImageDataset(
         csv_file=csv_file,
@@ -391,9 +413,9 @@ def build_whole_image_dataloader(
     )
 
     if shuffle is None:
-        shuffle = mode.lower() == "train"
+        shuffle = mode_lower == "train"
     if drop_last is None:
-        drop_last = bool(mode.lower() == "train" and dataloader_config.get("drop_last", False))
+        drop_last = bool(mode_lower == "train" and dataloader_config.get("drop_last", False))
 
     batch_size = int(
         whole_image_config.get("batch_size", train_config.get("batch_size", dataloader_config.get("batch_size", 16)))
@@ -403,11 +425,48 @@ def build_whole_image_dataloader(
     )
     pin_memory = bool(dataloader_config.get("pin_memory", False))
 
-    return DataLoader(
+    sampler = None
+    sampling_summary: dict[str, Any] = {
+        "enabled": False,
+        "strategy": "none",
+        "class_counts": {},
+        "target_epoch_size": None,
+        "default_epoch_size": None,
+        "source_num_samples": len(dataset),
+        "replacement": False,
+        "log_distribution": False,
+        "warnings": [],
+        "log_lines": [],
+    }
+
+    if mode_lower == "train":
+        sampling_config = train_config.get("sampling", {})
+        if not isinstance(sampling_config, dict):
+            raise ValueError("train.sampling must be a mapping (dict) when configured.")
+
+        sampler, sampling_summary = build_train_sampler(
+            dataset=dataset,
+            sampling_config=sampling_config,
+            seed=int(train_config.get("seed", 42)),
+        )
+
+        if sampler is not None:
+            shuffle = False
+
+        for line in sampling_summary.get("log_lines", []):
+            logging.info("%s", line)
+        for warning in sampling_summary.get("warnings", []):
+            logging.warning("%s", warning)
+
+    dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,
     )
+
+    setattr(dataloader, "sampling_summary", sampling_summary)
+    return dataloader

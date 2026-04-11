@@ -194,6 +194,50 @@ def load_label_names(label_mapping_path: Path | None, num_classes: int | None = 
     return None
 
 
+
+def _log_train_sampling_summary(train_loader: Any) -> dict[str, Any]:
+    summary = getattr(train_loader, "sampling_summary", {}) or {}
+    strategy = str(summary.get("strategy", "none")).lower()
+    target_epoch_size = summary.get("target_epoch_size")
+    replacement = summary.get("replacement")
+    class_counts = summary.get("class_counts", {})
+
+    logging.info("Train sampling summary | strategy=%s", strategy)
+    if target_epoch_size is not None:
+        logging.info(
+            "Train sampling summary | target_epoch_size=%s replacement=%s",
+            target_epoch_size,
+            replacement,
+        )
+    if summary.get("log_distribution", True) and class_counts:
+        logging.info("Train sampling summary | original_class_counts=%s", class_counts)
+
+    for warning in summary.get("warnings", []):
+        logging.warning("Train sampling summary | %s", warning)
+    return summary
+
+
+def _warn_double_rebalancing(config: dict[str, Any], sampling_summary: dict[str, Any]) -> None:
+    strategy = str(sampling_summary.get("strategy", "none")).lower()
+    if not bool(sampling_summary.get("enabled", False)) or strategy == "none":
+        return
+
+    loss_config = config.get("loss", {})
+    use_class_weights = bool(loss_config.get("use_class_weights", False))
+    use_focal_alpha = bool(loss_config.get("use_alpha_from_class_counts", False))
+    if not (use_class_weights or use_focal_alpha):
+        return
+
+    logging.warning(
+        "Detected potential double class rebalancing: train.sampling.strategy=%s with "
+        "loss.use_class_weights=%s and loss.use_alpha_from_class_counts=%s. "
+        "This may over-emphasize minority classes.",
+        strategy,
+        use_class_weights,
+        use_focal_alpha,
+    )
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -286,6 +330,9 @@ def run_training(
         project_root=PROJECT_ROOT,
         shuffle=False,
     )
+
+    train_sampling_summary = _log_train_sampling_summary(train_loader)
+    _warn_double_rebalancing(config, train_sampling_summary)
 
     model = build_model(config).to(device)
     optimizer = build_optimizer(config, model)
@@ -430,4 +477,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
