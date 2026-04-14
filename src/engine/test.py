@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -13,6 +13,7 @@ from tqdm import tqdm
 from src.datasets import build_whole_image_dataloader
 from src.losses import build_loss
 from src.models import build_model
+from src.utils.label_merge import resolve_label_merge_runtime
 from src.utils.metrics import build_image_level_metrics, save_confusion_matrix_figure, save_metrics_json
 
 
@@ -42,8 +43,27 @@ def _compute_class_counts(
     train_csv: Path,
     num_classes: int | None = None,
     label_names: list[str] | None = None,
+    label_mapping: dict[str, int] | None = None,
 ) -> list[int]:
     dataframe = pd.read_csv(train_csv)
+
+    if label_mapping is not None:
+        total_classes = int(num_classes) if num_classes is not None else (max(label_mapping.values()) + 1 if label_mapping else 0)
+        mapped_indices: list[int] = []
+        unknown_labels: list[str] = []
+        for label in dataframe["label"].astype(str).tolist():
+            if label not in label_mapping:
+                unknown_labels.append(label)
+                continue
+            mapped_indices.append(int(label_mapping[label]))
+
+        if unknown_labels:
+            unique_unknown = sorted(set(unknown_labels))
+            raise ValueError(f"Found labels in {train_csv} that are missing from label_mapping: {unique_unknown}")
+
+        counts = Counter(mapped_indices)
+        return [int(counts.get(index, 0)) for index in range(total_classes)]
+
     if "label_idx" in dataframe.columns:
         label_counts = Counter(dataframe["label_idx"].astype(int).tolist())
         total_classes = int(num_classes) if num_classes is not None else (max(label_counts.keys()) + 1 if label_counts else 0)
@@ -59,24 +79,6 @@ def _compute_class_counts(
 
     labels = sorted(counts)
     return [int(counts.get(label, 0)) for label in labels]
-
-
-def _load_label_names(label_mapping_path: Path | None, num_classes: int | None = None) -> list[str] | None:
-    if label_mapping_path is None or not label_mapping_path.exists():
-        return None
-
-    payload = json.loads(label_mapping_path.read_text(encoding="utf-8"))
-    if "index_to_label" in payload:
-        index_to_label = {int(index): label for index, label in payload["index_to_label"].items()}
-        if num_classes is None:
-            num_classes = max(index_to_label.keys()) + 1 if index_to_label else 0
-        return [index_to_label.get(index, str(index)) for index in range(num_classes)]
-
-    if "label_to_index" in payload:
-        label_to_index = {label: int(index) for label, index in payload["label_to_index"].items()}
-        return [label for label, _ in sorted(label_to_index.items(), key=lambda item: item[1])]
-
-    return None
 
 
 def _save_per_class_metrics_csv(metrics: dict[str, Any], output_path: Path) -> Path:
@@ -208,10 +210,25 @@ def run_test_from_checkpoint(
     _validate_task_mode(config)
 
     train_csv, test_csv, label_mapping_path = _resolve_split_csvs(project_root, config)
+    merge_runtime = resolve_label_merge_runtime(
+        config=config,
+        label_mapping_path=label_mapping_path,
+        fallback_num_classes=config.get("data", {}).get("num_classes"),
+    )
+    dataset_label_mapping = merge_runtime.get("dataset_label_mapping")
+    label_names = merge_runtime.get("label_names")
+    num_classes = merge_runtime.get("num_classes")
+    if num_classes is None:
+        raise ValueError("Unable to resolve class count from data.num_classes or label mapping.")
+
+    config.setdefault("data", {})
+    config["data"]["num_classes"] = int(num_classes)
+
     test_loader = build_whole_image_dataloader(
         csv_file=test_csv,
         mode="test",
         config=config,
+        label_mapping=dataset_label_mapping,
         label_mapping_path=label_mapping_path,
         project_root=project_root,
         shuffle=False,
@@ -221,11 +238,11 @@ def run_test_from_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    label_names = _load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
     class_counts = _compute_class_counts(
         train_csv,
-        num_classes=config.get("data", {}).get("num_classes"),
+        num_classes=int(num_classes),
         label_names=label_names,
+        label_mapping=dataset_label_mapping,
     )
     criterion = build_loss(config, class_counts=class_counts, device=device)
 

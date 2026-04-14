@@ -108,3 +108,48 @@ scheduler:
 
 evaluation:
   primary_metric: macro_f1
+
+search_merge:
+  enabled: true
+
+  target_num_classes: [6, 5, 4, 3]
+  beam_width: 8
+  top_n_final_per_target: 3
+
+  scoring:
+    metric: val_macro_f1
+    choose_best_repeat: true
+
+  cv:
+    enabled: true
+    n_splits: 3
+    epochs: 15
+    reuse_existing_folds: true
+    use_fixed_test_for_search: false
+
+  repeats:
+    num_repeats: 3
+    seed_mode: offset
+    base_seed: 42
+    seed_offsets: [0, 1, 2]
+
+  cache:
+    enabled: true
+    dir: outputs/merge_search_cache
+
+  historical_confusion:
+    enabled: false
+    paths: []
+    input_type: auto
+    normalize: true
+    average_multiple: true
+
+  medical_constraints:
+    must_stay_single: []
+    forbidden_pairs: []
+    preferred_pairs: []
+
+  output:
+    dir: outputs/merge_search
+    save_all_candidates: true
+    save_repeat_details: true

@@ -22,6 +22,7 @@ from src.engine import train_one_epoch, validate
 from src.losses import build_loss
 from src.models import build_model
 from src.utils.io import load_yaml
+from src.utils.label_merge import resolve_label_merge_runtime
 from src.utils.seed import seed_everything
 from src.utils.visualize import export_training_visualizations
 
@@ -157,8 +158,27 @@ def compute_class_counts(
     train_csv: Path,
     num_classes: int | None = None,
     label_names: list[str] | None = None,
+    label_mapping: dict[str, int] | None = None,
 ) -> list[int]:
     dataframe = pd.read_csv(train_csv)
+
+    if label_mapping is not None:
+        total_classes = int(num_classes) if num_classes is not None else (max(label_mapping.values()) + 1 if label_mapping else 0)
+        mapped_indices: list[int] = []
+        unknown_labels: list[str] = []
+        for label in dataframe["label"].astype(str).tolist():
+            if label not in label_mapping:
+                unknown_labels.append(label)
+                continue
+            mapped_indices.append(int(label_mapping[label]))
+
+        if unknown_labels:
+            unique_unknown = sorted(set(unknown_labels))
+            raise ValueError(f"Found labels in {train_csv} that are missing from label_mapping: {unique_unknown}")
+
+        counts = Counter(mapped_indices)
+        return [int(counts.get(index, 0)) for index in range(total_classes)]
+
     if "label_idx" in dataframe.columns:
         label_counts = Counter(dataframe["label_idx"].astype(int).tolist())
         total_classes = int(num_classes) if num_classes is not None else (max(label_counts.keys()) + 1 if label_counts else 0)
@@ -312,13 +332,27 @@ def run_training(
     )
 
     train_csv, val_csv, label_mapping_path = _resolve_split_csvs(config)
-    label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
-    num_classes = len(label_names) if label_names is not None else config.get("data", {}).get("num_classes")
+    merge_runtime = resolve_label_merge_runtime(
+        config=config,
+        label_mapping_path=label_mapping_path,
+        fallback_num_classes=config.get("data", {}).get("num_classes"),
+    )
+    dataset_label_mapping = merge_runtime.get("dataset_label_mapping")
+    label_names = merge_runtime.get("label_names")
+    num_classes = merge_runtime.get("num_classes")
+    if num_classes is None:
+        raise ValueError("Unable to resolve class count from data.num_classes or label mapping.")
+
+    config.setdefault("data", {})
+    config["data"]["num_classes"] = int(num_classes)
+    if merge_runtime.get("active"):
+        logging.info("Label merge enabled | merged_num_classes=%d", int(num_classes))
 
     train_loader = build_whole_image_dataloader(
         csv_file=train_csv,
         mode="train",
         config=config,
+        label_mapping=dataset_label_mapping,
         label_mapping_path=label_mapping_path,
         project_root=PROJECT_ROOT,
     )
@@ -326,6 +360,7 @@ def run_training(
         csv_file=val_csv,
         mode="val",
         config=config,
+        label_mapping=dataset_label_mapping,
         label_mapping_path=label_mapping_path,
         project_root=PROJECT_ROOT,
         shuffle=False,
@@ -337,7 +372,12 @@ def run_training(
     model = build_model(config).to(device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
-    class_counts = compute_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
+    class_counts = compute_class_counts(
+        train_csv,
+        num_classes=num_classes,
+        label_names=label_names,
+        label_mapping=dataset_label_mapping,
+    )
     criterion = build_loss(config, class_counts=class_counts, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 

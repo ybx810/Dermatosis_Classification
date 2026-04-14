@@ -391,6 +391,7 @@ def build_whole_image_dataloader(
     csv_file: str | Path,
     mode: str,
     config: dict[str, Any],
+    label_mapping: dict[str, int] | None = None,
     label_mapping_path: str | Path | None = None,
     shuffle: bool | None = None,
     drop_last: bool | None = None,
@@ -408,6 +409,7 @@ def build_whole_image_dataloader(
         mode=mode,
         transform_config=transform_config,
         whole_image_config=whole_image_config,
+        label_mapping=label_mapping,
         label_mapping_path=label_mapping_path or split_config.get("label_mapping_path"),
         project_root=project_root,
     )
