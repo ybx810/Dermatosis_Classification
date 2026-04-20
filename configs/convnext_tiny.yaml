@@ -13,6 +13,11 @@ data:
   cache_dir: data/cache
   num_classes: 18
 
+label_merge:
+  enabled: false
+  partition: []
+  merged_label_names: []
+
 build_image_splits:
   output_dir: data/splits
   label_mapping_path: data/splits/label_mapping.json

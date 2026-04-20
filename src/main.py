@@ -22,7 +22,11 @@ from src.engine import train_one_epoch, validate
 from src.losses import build_loss
 from src.models import build_model
 from src.utils.io import load_yaml
-from src.utils.label_merge import resolve_label_merge_runtime
+from src.utils.label_merge import (
+    build_merged_label_names,
+    build_old_to_new_mapping_from_partition,
+    resolve_label_merge_runtime,
+)
 from src.utils.seed import seed_everything
 from src.utils.visualize import export_training_visualizations
 
@@ -82,6 +86,55 @@ def resolve_run_dir(
 def save_config_snapshot(config: dict[str, Any], run_dir: Path) -> None:
     config_path = run_dir / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def save_label_merge_snapshot(
+    run_dir: Path,
+    train_csv: Path,
+    label_mapping_path: Path,
+    merge_runtime: dict[str, Any],
+) -> Path:
+    original_label_names = merge_runtime.get("original_label_names")
+    original_label_mapping = merge_runtime.get("original_label_mapping")
+    if (not original_label_names) and isinstance(original_label_mapping, dict):
+        original_label_names = [
+            label for label, _ in sorted(original_label_mapping.items(), key=lambda item: int(item[1]))
+        ]
+
+    if (not original_label_names) and train_csv.exists():
+        train_dataframe = pd.read_csv(train_csv)
+        original_label_names = sorted(train_dataframe["label"].astype(str).unique().tolist())
+
+    merged_label_names = merge_runtime.get("merged_label_names") or merge_runtime.get("label_names")
+    partition = merge_runtime.get("partition")
+    old_to_new = merge_runtime.get("old_to_new")
+    merge_enabled = bool(merge_runtime.get("active", False))
+
+    if merge_enabled and partition is not None and old_to_new is None:
+        old_to_new = build_old_to_new_mapping_from_partition(partition)
+
+    if partition is None and original_label_names:
+        partition = [[str(label)] for label in original_label_names]
+
+    if old_to_new is None and original_label_names:
+        old_to_new = {str(label): int(index) for index, label in enumerate(original_label_names)}
+
+    if merged_label_names is None and partition is not None:
+        merged_label_names = build_merged_label_names(partition)
+
+    payload = {
+        "enabled": merge_enabled,
+        "label_mapping_path": str(label_mapping_path),
+        "original_label_names": original_label_names,
+        "partition": partition,
+        "old_to_new": old_to_new,
+        "merged_label_names": merged_label_names,
+        "num_classes": merge_runtime.get("num_classes"),
+    }
+    output_path = run_dir / "label_merge_runtime.json"
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("Saved label merge runtime snapshot to %s", output_path)
+    return output_path
 
 
 def select_device(config: dict[str, Any]) -> torch.device:
@@ -347,6 +400,12 @@ def run_training(
     config["data"]["num_classes"] = int(num_classes)
     if merge_runtime.get("active"):
         logging.info("Label merge enabled | merged_num_classes=%d", int(num_classes))
+    save_label_merge_snapshot(
+        run_dir=resolved_run_dir,
+        train_csv=train_csv,
+        label_mapping_path=label_mapping_path,
+        merge_runtime=merge_runtime,
+    )
 
     train_loader = build_whole_image_dataloader(
         csv_file=train_csv,

@@ -13,6 +13,11 @@ data:
   cache_dir: data/cache
   num_classes: 11
 
+label_merge:
+  enabled: false
+  partition: []
+  merged_label_names: []
+
 build_image_splits:
   mode: kfold
   output_dir: data/splits

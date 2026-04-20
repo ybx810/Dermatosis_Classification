@@ -89,6 +89,19 @@ def build_merged_label_names(
     return names
 
 
+def _flatten_partition_labels(partition: list[list[str]]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for group in partition:
+        for label in group:
+            normalized = str(label)
+            if normalized in seen:
+                continue
+            ordered.append(normalized)
+            seen.add(normalized)
+    return ordered
+
+
 def resolve_label_merge_runtime(
     config: dict[str, Any],
     label_mapping_path: Path | None,
@@ -106,13 +119,17 @@ def resolve_label_merge_runtime(
             if label_names is not None
             else (int(fallback_num_classes) if fallback_num_classes is not None else None)
         )
+        original_label_names = list(base_label_order) if base_label_order is not None else label_names
         return {
             "active": False,
             "dataset_label_mapping": None,
             "label_names": label_names,
+            "merged_label_names": label_names,
             "num_classes": resolved_num_classes,
             "old_to_new": None,
             "partition": None,
+            "original_label_names": original_label_names,
+            "original_label_mapping": base_mapping,
         }
 
     raw_old_to_new = merge_cfg.get("old_to_new")
@@ -159,7 +176,10 @@ def resolve_label_merge_runtime(
         "active": True,
         "dataset_label_mapping": old_to_new,
         "label_names": merged_label_names,
+        "merged_label_names": merged_label_names,
         "num_classes": resolved_num_classes,
         "old_to_new": old_to_new,
         "partition": partition,
+        "original_label_names": list(base_label_order) if base_label_order is not None else _flatten_partition_labels(partition),
+        "original_label_mapping": base_mapping,
     }
