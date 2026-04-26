@@ -4,6 +4,8 @@ import torch
 from sklearn.metrics import f1_score
 from tqdm import tqdm
 
+from src.utils.finetune import set_frozen_backbone_eval
+
 
 @torch.no_grad()
 def _compute_epoch_metrics(predictions: list[int], targets: list[int]) -> dict[str, float]:
@@ -28,8 +30,10 @@ def train_one_epoch(
     epoch: int,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
+    finetune_mode: str = "full",
 ) -> dict[str, float]:
     model.train()
+    set_frozen_backbone_eval(model, finetune_mode)
 
     running_loss = 0.0
     predictions: list[int] = []

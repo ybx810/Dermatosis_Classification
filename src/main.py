@@ -21,6 +21,7 @@ from src.datasets import build_whole_image_dataloader
 from src.engine import train_one_epoch, validate
 from src.losses import build_loss
 from src.models import build_model
+from src.utils.finetune import configure_trainable_parameters, set_frozen_backbone_eval
 from src.utils.io import load_yaml
 from src.utils.label_merge import (
     build_merged_label_names,
@@ -149,15 +150,21 @@ def build_optimizer(config: dict[str, Any], model: torch.nn.Module) -> torch.opt
     name = str(optimizer_config.get("name", "adam")).lower()
     lr = float(optimizer_config.get("lr", 3e-4))
     weight_decay = float(optimizer_config.get("weight_decay", 0.0))
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise ValueError(
+            "No trainable parameters available for optimizer construction. "
+            "Please check finetune settings and model configuration."
+        )
 
     if name == "adam":
-        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(trainable_parameters, lr=lr, weight_decay=weight_decay)
     if name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
     if name == "sgd":
         momentum = float(optimizer_config.get("momentum", 0.9))
         return torch.optim.SGD(
-            model.parameters(),
+            trainable_parameters,
             lr=lr,
             momentum=momentum,
             weight_decay=weight_decay,
@@ -311,6 +318,38 @@ def _warn_double_rebalancing(config: dict[str, Any], sampling_summary: dict[str,
     )
 
 
+def _log_finetune_summary(summary: dict[str, Any]) -> None:
+    logging.info(
+        "Finetune mode: %s (enabled=%s, requested=%s)",
+        summary.get("mode"),
+        summary.get("enabled"),
+        summary.get("requested_mode"),
+    )
+    logging.info(
+        "Trainable parameters: %d / %d",
+        int(summary.get("trainable_params", 0)),
+        int(summary.get("total_params", 0)),
+    )
+    logging.info("Frozen backbone parameters: %d", int(summary.get("frozen_params", 0)))
+    trainable_modules = summary.get("trainable_modules") or []
+    logging.info(
+        "Trainable modules: %s",
+        ", ".join(str(module_name) for module_name in trainable_modules) if trainable_modules else "none",
+    )
+
+    mode = str(summary.get("mode", "full")).lower()
+    if mode == "head_only":
+        trainable_parameter_names = summary.get("trainable_parameter_names") or []
+        logging.info(
+            "Trainable parameter names: %s",
+            ", ".join(str(name) for name in trainable_parameter_names) if trainable_parameter_names else "none",
+        )
+        logging.info(
+            "Frozen backbone BatchNorm modules forced to eval: %d",
+            int(summary.get("frozen_backbone_bn_modules", 0)),
+        )
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -429,6 +468,11 @@ def run_training(
     _warn_double_rebalancing(config, train_sampling_summary)
 
     model = build_model(config).to(device)
+    finetune_summary = configure_trainable_parameters(model, config)
+    bn_eval_summary = set_frozen_backbone_eval(model, finetune_summary["mode"])
+    finetune_summary["frozen_backbone_bn_modules"] = bn_eval_summary.get("bn_modules_forced_eval", 0)
+    _log_finetune_summary(finetune_summary)
+
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
     class_counts = compute_class_counts(
@@ -470,6 +514,7 @@ def run_training(
             epoch=epoch,
             scaler=scaler,
             use_amp=use_amp,
+            finetune_mode=finetune_summary["mode"],
         )
         val_metrics = validate(
             model=model,

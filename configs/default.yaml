@@ -3,6 +3,9 @@ project:
   task: whole-image-classification
   output_dir: outputs
 
+summary:
+  summarize_dir: outputs/comparison
+
 task:
   mode: whole_image
 
@@ -89,6 +92,10 @@ model:
   name: efficientnet_b0
   pretrained: true
   dropout: 0.5
+
+finetune:
+  enabled: false
+  mode: full
 
 loss:
   name: focal

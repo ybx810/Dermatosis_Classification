@@ -6,16 +6,30 @@ import json
 from pathlib import Path
 from typing import Any
 
+import yaml
 
-METRIC_FIELDS = ["accuracy", "macro_f1", "auc_ovr"]
-CSV_COLUMNS = ["experiment", "metrics_path", "accuracy", "macro_f1", "auc_ovr", "status"]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_PATH = "configs/default.yaml"
+DEFAULT_SUMMARY_DIR = "outputs/comparison"
+METRIC_FIELDS = ["accuracy", "precision", "recall", "macro_f1", "auc_ovr"]
+CSV_COLUMNS = [
+    "experiment",
+    "metrics_path",
+    "accuracy",
+    "precision",
+    "recall",
+    "macro_f1",
+    "auc_ovr",
+    "status",
+]
 
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize experiment metrics under outputs/.")
     parser.add_argument("--outputs-dir", type=str, default="outputs")
-    parser.add_argument("--summary-dir", type=str, default="outputs/summary")
+    parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--summary-dir", type=str, default=None)
     return parser.parse_args()
 
 
@@ -24,7 +38,43 @@ def resolve_path(path_value: str | Path) -> Path:
     path = Path(path_value)
     if path.is_absolute():
         return path
-    return Path(__file__).resolve().parents[1] / path
+    return PROJECT_ROOT / path
+
+
+
+def load_yaml_config(config_path: Path) -> dict[str, Any]:
+    # Load YAML config as a top-level mapping and surface explicit read/parse errors.
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Failed to parse YAML config: {config_path}. {exc}") from exc
+    except OSError as exc:
+        raise OSError(f"Failed to read config file: {config_path}. {exc}") from exc
+
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid YAML config format (expected mapping): {config_path}")
+    return payload
+
+
+
+def resolve_summary_dir(args: argparse.Namespace, config: dict[str, Any]) -> Path:
+    # Priority: CLI --summary-dir > YAML summary.summarize_dir > default.
+    if args.summary_dir:
+        return resolve_path(args.summary_dir)
+
+    summary_config = config.get("summary", {})
+    if isinstance(summary_config, dict):
+        yaml_summary_dir = summary_config.get("summarize_dir")
+        if yaml_summary_dir:
+            return resolve_path(str(yaml_summary_dir))
+
+    return resolve_path(DEFAULT_SUMMARY_DIR)
 
 
 
@@ -87,15 +137,17 @@ def write_summary_csv(rows: list[dict[str, str]], output_path: Path) -> Path:
 
 
 def build_markdown_table(rows: list[dict[str, str]]) -> str:
-    header = "| Experiment | Accuracy | Macro F1 | AUC | Status |"
-    separator = "|---|---:|---:|---:|---|"
+    header = "| Experiment | Accuracy | Precision | Recall | Macro F1 | AUC OVR | Status |"
+    separator = "|---|---:|---:|---:|---:|---:|---|"
     if not rows:
         return "# Experiment Summary\n\nNo `metrics.json` files were found under `outputs/`."
 
     lines = ["# Experiment Summary", "", header, separator]
     for row in rows:
         lines.append(
-            "| {experiment} | {accuracy} | {macro_f1} | {auc_ovr} | {status} |".format(**row)
+            "| {experiment} | {accuracy} | {precision} | {recall} | {macro_f1} | {auc_ovr} | {status} |".format(
+                **row
+            )
         )
     return "\n".join(lines)
 
@@ -120,8 +172,14 @@ def summarize_results(outputs_dir: Path, summary_dir: Path) -> tuple[Path, Path,
 
 def main() -> None:
     args = parse_args()
+    config_path = resolve_path(args.config)
+    try:
+        config = load_yaml_config(config_path)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
     outputs_dir = resolve_path(args.outputs_dir)
-    summary_dir = resolve_path(args.summary_dir)
+    summary_dir = resolve_summary_dir(args, config)
     csv_path, markdown_path, count = summarize_results(outputs_dir, summary_dir)
     print(f"Collected {count} experiment result(s).")
     print(f"CSV summary saved to: {csv_path}")
