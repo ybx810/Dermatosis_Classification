@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--run-dir", type=str, default=None)
+    parser.add_argument("--test-csv", type=str, default=None)
     return parser.parse_args()
 
 
@@ -51,6 +52,7 @@ def main() -> None:
         config=config,
         checkpoint_path=checkpoint_path,
         run_dir=run_dir,
+        test_csv=args.test_csv,
     )
     logging.info(
         "Finished test evaluation | primary=%s acc=%.4f macro_f1=%.4f loss=%.4f",

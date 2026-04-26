@@ -22,6 +22,15 @@ from src.engine import train_one_epoch, validate
 from src.losses import build_loss
 from src.models import build_model
 from src.utils.io import load_yaml
+from src.utils.label_merge import (
+    apply_label_merge_to_dataframe,
+    build_label_merge_mapping,
+    get_label_names_from_mapping,
+    is_label_merge_enabled,
+    save_label_merge_mapping,
+    update_config_num_classes_from_mapping,
+    validate_label_merge_coverage,
+)
 from src.utils.seed import seed_everything
 from src.utils.visualize import export_training_visualizations
 
@@ -56,6 +65,12 @@ def resolve_path(path_value: str | Path | None) -> Path | None:
 
 
 def build_run_dir(config: dict[str, Any]) -> Path:
+    explicit_run_dir = config.get("project", {}).get("run_dir")
+    if explicit_run_dir:
+        run_dir = resolve_path(explicit_run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
     project_name = str(config.get("project", {}).get("name", "patch-classification"))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = resolve_path(config.get("project", {}).get("output_dir", "outputs"))
@@ -127,8 +142,31 @@ def compute_class_counts(
     train_csv: Path,
     num_classes: int | None = None,
     label_names: list[str] | None = None,
+    label_merge_mapping: dict[str, Any] | None = None,
+    strict_label_merge: bool = True,
 ) -> list[int]:
     dataframe = pd.read_csv(train_csv)
+    if label_merge_mapping is not None:
+        merged_dataframe = apply_label_merge_to_dataframe(
+            dataframe,
+            mapping=label_merge_mapping,
+            strict=strict_label_merge,
+        )
+        label_counts = Counter(merged_dataframe["merged_label_idx"].astype(int).tolist())
+        total_classes = int(num_classes) if num_classes is not None else int(label_merge_mapping["num_classes"])
+        counts = [int(label_counts.get(index, 0)) for index in range(total_classes)]
+        missing_indices = [index for index, count in enumerate(counts) if count == 0]
+        if missing_indices:
+            missing_names = [
+                label_names[index] if label_names is not None and index < len(label_names) else str(index)
+                for index in missing_indices
+            ]
+            raise ValueError(
+                f"Training split {train_csv} is missing merged classes: {missing_names}. "
+                "Every merged class must have at least one training sample."
+            )
+        return counts
+
     if "label_idx" in dataframe.columns:
         label_counts = Counter(dataframe["label_idx"].astype(int).tolist())
         total_classes = int(num_classes) if num_classes is not None else (max(label_counts.keys()) + 1 if label_counts else 0)
@@ -208,12 +246,19 @@ def _build_train_and_val_loaders(
     train_csv: Path,
     val_csv: Path,
     label_mapping_path: Path | None,
+    label_merge_mapping: dict[str, Any] | None = None,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    label_merge_config = config.get("label_merge", {}) or {}
+    use_merged_label = label_merge_mapping is not None
+    strict_label_merge = bool(label_merge_config.get("strict", True))
     train_loader = build_dataloader(
         csv_file=train_csv,
         mode="train",
         config=config,
         label_mapping_path=label_mapping_path,
+        label_merge_mapping=label_merge_mapping,
+        use_merged_label=use_merged_label,
+        strict_label_merge=strict_label_merge,
         project_root=PROJECT_ROOT,
     )
     val_loader = build_dataloader(
@@ -221,10 +266,40 @@ def _build_train_and_val_loaders(
         mode="val",
         config=config,
         label_mapping_path=label_mapping_path,
+        label_merge_mapping=label_merge_mapping,
+        use_merged_label=use_merged_label,
+        strict_label_merge=strict_label_merge,
         project_root=PROJECT_ROOT,
         shuffle=False,
     )
     return train_loader, val_loader
+
+
+def _resolve_split_csvs(config: dict[str, Any]) -> tuple[Path, Path, Path]:
+    split_config = config.get("build_patch_splits", {})
+    split_dir = resolve_path(split_config.get("output_dir", "data/splits"))
+    train_csv = resolve_path(split_config.get("train_csv")) if split_config.get("train_csv") else split_dir / "train.csv"
+    val_csv = resolve_path(split_config.get("val_csv")) if split_config.get("val_csv") else split_dir / "val.csv"
+    label_mapping_path = resolve_path(split_config.get("label_mapping_path", "data/splits/label_mapping.json"))
+    return train_csv, val_csv, label_mapping_path
+
+
+def _prepare_label_merge_for_training(
+    config: dict[str, Any],
+    train_csv: Path,
+    val_csv: Path,
+) -> tuple[dict[str, Any] | None, list[str] | None]:
+    if not is_label_merge_enabled(config):
+        return None, None
+
+    label_merge_config = config.get("label_merge", {}) or {}
+    strict_label_merge = bool(label_merge_config.get("strict", True))
+    mapping = build_label_merge_mapping(config)
+    train_df = pd.read_csv(train_csv)
+    val_df = pd.read_csv(val_csv)
+    validate_label_merge_coverage([train_df, val_df], mapping, strict=strict_label_merge)
+    update_config_num_classes_from_mapping(config, mapping)
+    return mapping, get_label_names_from_mapping(mapping)
 
 
 def run_training(config: dict[str, Any]) -> Path:
@@ -241,11 +316,10 @@ def run_training(config: dict[str, Any]) -> Path:
     logging.info("Device: %s", device)
     logging.info("AMP enabled: %s", use_amp)
 
-    split_dir = resolve_path(config.get("build_patch_splits", {}).get("output_dir", "data/splits"))
-    label_mapping_path = resolve_path(config.get("build_patch_splits", {}).get("label_mapping_path", "data/splits/label_mapping.json"))
-    train_csv = split_dir / "train.csv"
-    val_csv = split_dir / "val.csv"
-    label_names = load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
+    train_csv, val_csv, label_mapping_path = _resolve_split_csvs(config)
+    label_merge_mapping, merged_label_names = _prepare_label_merge_for_training(config, train_csv, val_csv)
+    save_config_snapshot(config, run_dir)
+    label_names = merged_label_names or load_label_names(label_mapping_path, num_classes=config.get("data", {}).get("num_classes"))
     num_classes = len(label_names) if label_names is not None else config.get("data", {}).get("num_classes")
 
     train_loader, val_loader = _build_train_and_val_loaders(
@@ -253,23 +327,34 @@ def run_training(config: dict[str, Any]) -> Path:
         train_csv=train_csv,
         val_csv=val_csv,
         label_mapping_path=label_mapping_path,
+        label_merge_mapping=label_merge_mapping,
     )
 
     model = build_model(config).to(device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, num_epochs=int(config.get("train", {}).get("epochs", 20)))
-    class_counts = compute_class_counts(train_csv, num_classes=num_classes, label_names=label_names)
+    class_counts = compute_class_counts(
+        train_csv,
+        num_classes=num_classes,
+        label_names=label_names,
+        label_merge_mapping=label_merge_mapping,
+        strict_label_merge=bool((config.get("label_merge", {}) or {}).get("strict", True)),
+    )
     criterion = build_loss(config, class_counts=class_counts, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     logging.info("Model: %s", config.get("model", {}).get("name", "resnet18"))
     logging.info("Loss: %s", config.get("loss", {}).get("name", "cross_entropy"))
     logging.info("Train samples: %s | Val samples: %s", len(train_loader.dataset), len(val_loader.dataset))
+    logging.info("Class counts: %s", class_counts)
     logging.info(
         "Evaluation: level=%s aggregation=%s",
         config.get("evaluation", {}).get("level", "both"),
         config.get("evaluation", {}).get("aggregation", "mean_prob"),
     )
+    if label_merge_mapping is not None:
+        save_label_merge_mapping(label_merge_mapping, run_dir / "label_mapping_effective.json")
+        logging.info("Label merge enabled with %s classes: %s", label_merge_mapping["num_classes"], label_names)
 
     num_epochs = int(config.get("train", {}).get("epochs", 20))
     history: list[dict[str, float | int | str | None]] = []

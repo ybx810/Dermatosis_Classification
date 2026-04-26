@@ -10,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import DataLoader, Dataset
 
 from src.datasets.transforms import build_patch_transforms
+from src.utils.label_merge import apply_label_merge_to_dataframe
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_COLUMNS = {"patch_path", "label"}
@@ -26,6 +27,9 @@ class SkinPatchDataset(Dataset):
         transform_config: dict[str, Any] | None = None,
         label_mapping: dict[str, int] | None = None,
         label_mapping_path: str | Path | None = None,
+        label_merge_mapping: dict[str, Any] | None = None,
+        use_merged_label: bool = False,
+        strict_label_merge: bool = True,
         project_root: str | Path | None = None,
     ) -> None:
         self.csv_file = Path(csv_file)
@@ -34,8 +38,25 @@ class SkinPatchDataset(Dataset):
             raise ValueError(f"mode must be one of train/val/test, got: {mode}")
 
         self.project_root = Path(project_root) if project_root is not None else PROJECT_ROOT
+        self.use_merged_label = bool(use_merged_label)
+        self.label_merge_mapping = label_merge_mapping
+        self.strict_label_merge = bool(strict_label_merge)
         self.samples = self._load_samples(self.csv_file)
-        self.label_mapping = self._build_label_mapping(label_mapping, label_mapping_path)
+        if self.use_merged_label:
+            if self.label_merge_mapping is None:
+                raise ValueError("use_merged_label=True requires label_merge_mapping.")
+            self.samples = apply_label_merge_to_dataframe(
+                self.samples,
+                mapping=self.label_merge_mapping,
+                label_col="label",
+                strict=self.strict_label_merge,
+            )
+            self.label_mapping = {
+                str(name): int(index)
+                for name, index in self.label_merge_mapping["merged_name_to_index"].items()
+            }
+        else:
+            self.label_mapping = self._build_label_mapping(label_mapping, label_mapping_path)
         self.transform = transform or build_patch_transforms(self.mode, transform_config)
 
     def __len__(self) -> int:
@@ -68,18 +89,27 @@ class SkinPatchDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image=image)["image"]
 
-        label_name = str(row["label"])
-        if label_name not in self.label_mapping:
+        original_label_name = str(row["label"])
+        if self.use_merged_label:
+            label_name = str(row["merged_label"])
+            label_index = int(row["merged_label_idx"])
+        else:
+            label_name = original_label_name
+            label_index = int(self.label_mapping[label_name]) if label_name in self.label_mapping else None
+
+        if label_index is None:
             raise KeyError(
                 f"Label '{label_name}' from {self.csv_file} is missing in label mapping: {self.label_mapping}"
             )
 
         sample = {
             "image": image,
-            "label": int(self.label_mapping[label_name]),
+            "label": int(label_index),
             "label_name": label_name,
             "patch_path": str(row["patch_path"]),
         }
+        if self.use_merged_label:
+            sample["original_label_name"] = original_label_name
 
         if "source_image" in row.index:
             sample["source_image"] = str(row["source_image"])
@@ -141,6 +171,9 @@ def build_dataloader(
     mode: str,
     config: dict[str, Any],
     label_mapping_path: str | Path | None = None,
+    label_merge_mapping: dict[str, Any] | None = None,
+    use_merged_label: bool | None = None,
+    strict_label_merge: bool | None = None,
     shuffle: bool | None = None,
     drop_last: bool | None = None,
     project_root: str | Path | None = None,
@@ -149,12 +182,20 @@ def build_dataloader(
     dataloader_config = config.get("dataloader", {})
     split_config = config.get("build_patch_splits", {})
     transform_config = config.get("augmentation", {})
+    label_merge_config = config.get("label_merge", {}) or {}
+    if use_merged_label is None:
+        use_merged_label = bool(label_merge_config.get("enabled", False))
+    if strict_label_merge is None:
+        strict_label_merge = bool(label_merge_config.get("strict", True))
 
     dataset = SkinPatchDataset(
         csv_file=csv_file,
         mode=mode,
         transform_config=transform_config,
         label_mapping_path=label_mapping_path or split_config.get("label_mapping_path"),
+        label_merge_mapping=label_merge_mapping,
+        use_merged_label=bool(use_merged_label),
+        strict_label_merge=bool(strict_label_merge),
         project_root=project_root,
     )
 

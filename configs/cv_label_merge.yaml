@@ -1,4 +1,4 @@
-﻿project:
+project:
   name: large-medical-image-patch-classification
   task: patch-classification
   output_dir: outputs
@@ -42,7 +42,7 @@ build_patch_splits:
   group_by: auto
 
 cross_validation:
-  enabled: false
+  enabled: true
   mode: existing_splits
   num_folds: 3
   split_root: data/splits_cv
@@ -57,11 +57,28 @@ cross_validation:
   patch_exists_sample_size: 1000
 
 label_merge:
-  enabled: false
-  name:
+  enabled: true
+  name: merge_5class_example
   auto_set_num_classes: true
   strict: true
-  groups: {}
+  groups:
+    inflammatory_epidermal:
+      - eczema
+      - drug eruption
+      - lichenplanus
+      - pemphigus
+      - pityriasis rosea
+      - prurigo
+    mycosis_fungoides:
+      - mycosis fungoides
+    immune_vasculitis:
+      - urticarial vasculitis
+      - lupus erythematosus
+    erythroderma_related:
+      - erythroderma
+      - erythroderma psoriaticum
+    psoriasis_related:
+      - psoriasis
 
 evaluation:
   level: both
